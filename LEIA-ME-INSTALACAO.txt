@@ -1,0 +1,36 @@
+CORTEX · PAINEL DE VENDAS — INSTALAÇÃO RÁPIDA
+============================================
+
+Não precisa instalar Python.
+
+1) Descompacte esta pasta inteira (ex.: C:\Cortex)
+
+2) Dê duplo-clique em Cortex.exe
+
+3) Na primeira vez:
+   - Será criado o arquivo .env (configuração)
+   - O navegador abrirá em http://127.0.0.1:8000
+
+4) Login inicial (admin criado automaticamente):
+   - O e-mail e a senha aparecem na janela preta na primeira execução
+     OU consulte quem enviou o pacote.
+
+5) OBRIGATÓRIO — chave do Ploomes no .env:
+   - PLOOMES_API_KEY=sua-chave
+   - Sem isso o Cortex não abre (só dados reais do CRM).
+   - Neppo e OpenRouter são opcionais no mesmo arquivo .env
+
+MODO DEMONSTRAÇÃO (só dev)
+--------------------------
+Só se precisar testar sem Ploomes: CORTEX_USE_MOCK=1 no .env
+
+ENCERRAR
+--------
+Feche a janela preta do Cortex (ou Ctrl+C) para parar o servidor.
+
+PROBLEMAS
+---------
+- "Porta 8000 em uso": feche outro Cortex ou outro programa na porta 8000
+- Antivírus bloqueando: permita Cortex.exe na pasta descompactada
+- Windows SmartScreen: "Mais informações" → "Executar assim mesmo"
+  (o .exe não é assinado digitalmente)
