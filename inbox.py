@@ -50,17 +50,24 @@ def _crm_snippet(c: Conversation) -> str:
     return " · ".join(parts)[:160]
 
 
-def enrich_conversation(c: Conversation, *, user_id: Optional[int] = None) -> None:
-    """Preenche metadados de inbox a partir do SQLite (mensagens WhatsApp)."""
+def enrich_conversation(c: Conversation, *, user_id: Optional[int] = None,
+                        snoozed_ids: Optional[set] = None,
+                        seen_sigs: Optional[dict] = None) -> None:
+    """Preenche metadados de inbox a partir do SQLite (mensagens WhatsApp).
+
+    `snoozed_ids`/`seen_sigs` podem ser pré-carregados (1 consulta para a lista
+    inteira) — evita N+1 ao enriquecer muitas conversas de uma vez."""
     import db
 
     digits = _digits_for_conv(c)
     c.no_phone = len(digits) < 10
 
-    if user_id and db.is_snoozed(user_id, c.id):
-        c.snoozed = True
-    else:
+    if not user_id:
         c.snoozed = False
+    elif snoozed_ids is not None:
+        c.snoozed = c.id in snoozed_ids
+    else:
+        c.snoozed = db.is_snoozed(user_id, c.id)
 
     if digits:
         last = db.last_message_for_phone(digits)
@@ -81,15 +88,19 @@ def enrich_conversation(c: Conversation, *, user_id: Optional[int] = None) -> No
         c.last_preview = _crm_snippet(c)
 
     if user_id and digits:
-        sig = db.get_seen_sig(user_id, c.id)
+        sig = seen_sigs.get(c.id) if seen_sigs is not None else db.get_seen_sig(user_id, c.id)
         c.unread_count = db.unread_since_sig(digits, sig) if sig else (1 if c.awaiting_reply else 0)
     else:
         c.unread_count = 0
 
 
 def enrich_all(items: list[Conversation], *, user_id: Optional[int] = None) -> None:
+    import db
+    snoozed_ids = db.snoozed_set(user_id) if user_id else set()
+    seen_sigs = db.seen_map(user_id) if user_id else {}
     for c in items:
-        enrich_conversation(c, user_id=user_id)
+        enrich_conversation(c, user_id=user_id,
+                            snoozed_ids=snoozed_ids, seen_sigs=seen_sigs)
 
 
 def sort_conversations(items: list[Conversation], mode: str) -> list[Conversation]:

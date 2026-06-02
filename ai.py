@@ -86,7 +86,14 @@ _SYSTEM_BASE = (
     "- Mensagens de WhatsApp devem ser curtas e naturais, como um vendedor "
     "humano escreveria. Sem markdown, sem listas longas, no máximo ~4 linhas.\n"
     "- Responda apenas o que foi pedido, sem preâmbulo nem comentários sobre "
-    "seu processo."
+    "seu processo.\n"
+    "- LEIA o que o cliente já enviou antes de responder. Se ele JÁ informou "
+    "itens e quantidades (ex.: '60 unid. Lixeira 20 litros azul'), NUNCA "
+    "pergunte de novo o item nem a quantidade. Em vez disso: confirme que "
+    "entendeu o pedido repetindo brevemente os itens e quantidades para "
+    "conferência e avance (ex.: dizer que vai montar o orçamento na tabela "
+    "dele e retornar com valores e prazo). Só pergunte o que realmente falta "
+    "(ex.: CNPJ/endereço de entrega, forma de pagamento) — nada que já foi dito."
 )
 
 
@@ -245,8 +252,10 @@ async def draft_reply(ctx: dict, instruction: str = "") -> str:
     return await _ask(
         ctx,
         "Escreva a próxima mensagem de WhatsApp do vendedor para este cliente, "
-        "respondendo à última mensagem dele com base no contexto. Apenas o texto "
-        "da mensagem, pronto para enviar." + extra,
+        "respondendo à última mensagem dele com base no contexto. Se o cliente "
+        "já listou itens e quantidades, trate como um pedido: confirme os itens "
+        "entendidos e siga para o orçamento — não peça de novo item nem "
+        "quantidade. Apenas o texto da mensagem, pronto para enviar." + extra,
         max_tokens=450,
     )
 

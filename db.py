@@ -49,13 +49,15 @@ def _init(c: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             neppo_id INTEGER UNIQUE,
             phone TEXT NOT NULL,
+            phone_tail TEXT,                        -- últimos 8 dígitos (p/ casar rápido)
             direction TEXT NOT NULL,                -- 'in' | 'out'
             text TEXT,
             media TEXT,
             ct TEXT DEFAULT 'TEXT',
             bot INTEGER DEFAULT 0,
             name TEXT,
-            ts TEXT                                 -- ISO
+            ts TEXT,                                -- ISO
+            agent_id INTEGER                        -- agente Neppo que enviou
         );
         CREATE INDEX IF NOT EXISTS ix_msg_phone ON messages(phone, ts);
         CREATE TABLE IF NOT EXISTS seen(
@@ -82,6 +84,18 @@ def _init(c: sqlite3.Connection) -> None:
     cols = [r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()]
     if "active" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN active INTEGER DEFAULT 1")
+    # migração: coluna 'phone_tail' em messages (bancos antigos) + backfill
+    mcols = [r["name"] for r in c.execute("PRAGMA table_info(messages)").fetchall()]
+    if "phone_tail" not in mcols:
+        c.execute("ALTER TABLE messages ADD COLUMN phone_tail TEXT")
+        for r in c.execute("SELECT id, phone FROM messages").fetchall():
+            c.execute("UPDATE messages SET phone_tail=? WHERE id=?",
+                      (_phone_tail(r["phone"]), r["id"]))
+    # migração: id do agente Neppo que enviou a mensagem (p/ atribuir dono)
+    if "agent_id" not in mcols:
+        c.execute("ALTER TABLE messages ADD COLUMN agent_id INTEGER")
+    # índice criado após a migração (coluna garantida em banco novo e antigo)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_msg_tail ON messages(phone_tail, ts)")
     c.commit()
 
 
@@ -94,6 +108,24 @@ def save_feedback(action: str, intent_id: str, conversation_id: str,
 def feedback_stats() -> list[dict]:
     rows = q("SELECT action, COUNT(*) n FROM feedback GROUP BY action")
     return [dict(r) for r in rows]
+
+
+def feedback_by_intent() -> dict[str, dict]:
+    """Por intenção: quantas vezes a sugestão foi usada/editada/ignorada +
+    taxa de aceitação. Base p/ saber quais templates afinar."""
+    rows = q("SELECT intent_id, action, COUNT(*) n FROM feedback "
+             "WHERE intent_id IS NOT NULL GROUP BY intent_id, action")
+    out: dict[str, dict] = {}
+    for r in rows:
+        d = out.setdefault(r["intent_id"], {"used": 0, "edited": 0, "ignored": 0})
+        if r["action"] in d:
+            d[r["action"]] = r["n"]
+    for d in out.values():
+        total = d["used"] + d["edited"] + d["ignored"]
+        d["total"] = total
+        # aceitação: usar=1, editar=0.5 (aproveitou mas ajustou), ignorar=0
+        d["acceptance"] = round((d["used"] + 0.5 * d["edited"]) / total, 2) if total else None
+    return out
 
 
 def q(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -125,42 +157,34 @@ def runmany(sql: str, seq: list[tuple]) -> None:
 # -- mensagens de WhatsApp ---------------------------------------------------
 def save_message(*, phone: str, direction: str, text: str = "", media: str = "",
                  ct: str = "TEXT", bot: bool = False, name: str = "",
-                 ts: str = "", neppo_id: Optional[int] = None) -> None:
+                 ts: str = "", neppo_id: Optional[int] = None,
+                 agent_id: Optional[int] = None) -> None:
     """Insere uma mensagem (ignora duplicata por neppo_id)."""
     if not phone:
         return
     with _lock:
         c = conn()
         c.execute(
-            "INSERT OR IGNORE INTO messages(neppo_id,phone,direction,text,media,ct,bot,name,ts)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
-            (neppo_id, phone, direction, text, media, ct, int(bool(bot)), name, ts),
+            "INSERT OR IGNORE INTO messages"
+            "(neppo_id,phone,phone_tail,direction,text,media,ct,bot,name,ts,agent_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (neppo_id, phone, _phone_tail(phone), direction, text, media, ct,
+             int(bool(bot)), name, _normalize_ts(ts), agent_id),
         )
         c.commit()
 
 
-def messages_for(phone_digits: str, limit: int = 200) -> list[dict]:
-    """Histórico de um telefone (casando pelos últimos 8+ dígitos)."""
-    digits = "".join(ch for ch in (phone_digits or "") if ch.isdigit())
-    if not digits:
-        return []
-    tail = digits[-8:]
-    rows = q(
-        "SELECT direction,text,media,ct,bot,ts FROM messages "
-        "WHERE replace(replace(replace(phone,'(',''),')',''),'-','') LIKE ? "
-        "ORDER BY ts ASC LIMIT ?",
-        (f"%{tail}%", limit),
+def last_agent_for_phone(phone_digits: str) -> Optional[int]:
+    """Id do agente Neppo da mensagem de saída mais recente desse telefone."""
+    tail = _phone_tail(phone_digits)
+    if not tail:
+        return None
+    r = q1(
+        "SELECT agent_id FROM messages WHERE phone_tail=? AND agent_id IS NOT NULL "
+        "ORDER BY ts DESC LIMIT 1",
+        (tail,),
     )
-    return [dict(r) for r in rows]
-
-
-def message_count(phone_digits: str = "") -> int:
-    if phone_digits:
-        digits = "".join(ch for ch in phone_digits if ch.isdigit())[-8:]
-        r = q1("SELECT COUNT(*) n FROM messages WHERE phone LIKE ?", (f"%{digits}%",))
-    else:
-        r = q1("SELECT COUNT(*) n FROM messages")
-    return r["n"] if r else 0
+    return r["agent_id"] if r and r["agent_id"] is not None else None
 
 
 def _phone_tail(phone_digits: str) -> str:
@@ -168,9 +192,48 @@ def _phone_tail(phone_digits: str) -> str:
     return digits[-8:] if len(digits) >= 8 else digits
 
 
-_PHONE_MATCH = (
-    "replace(replace(replace(replace(phone,'(',''),')',''),'-',''),' ','') LIKE ?"
-)
+def _normalize_ts(ts) -> str:
+    """Padroniza o timestamp em ISO 8601 — aceita ISO (com Z/offset) e epoch
+    (s ou ms). Sem isso, webhook (isoformat) e backfill (createdAt do Neppo)
+    gravam formatos diferentes e a ordenação/MAX(ts) fica errada."""
+    s = str(ts or "").strip()
+    if not s:
+        return ""
+    import datetime as _dt
+    if s.isdigit():
+        try:
+            val = int(s)
+            if val > 1_000_000_000_000:      # milissegundos
+                val //= 1000
+            return _dt.datetime.fromtimestamp(val, _dt.timezone.utc).isoformat()
+        except (ValueError, OverflowError, OSError):
+            return s
+    try:
+        return _dt.datetime.fromisoformat(s.replace("Z", "+00:00")).isoformat()
+    except ValueError:
+        return s
+
+
+def messages_for(phone_digits: str, limit: int = 200) -> list[dict]:
+    """Histórico de um telefone (casando pelos últimos 8 dígitos, indexado)."""
+    tail = _phone_tail(phone_digits)
+    if not tail:
+        return []
+    rows = q(
+        "SELECT direction,text,media,ct,bot,ts FROM messages "
+        "WHERE phone_tail=? ORDER BY ts ASC LIMIT ?",
+        (tail, limit),
+    )
+    return [dict(r) for r in rows]
+
+
+def message_count(phone_digits: str = "") -> int:
+    if phone_digits:
+        r = q1("SELECT COUNT(*) n FROM messages WHERE phone_tail=?",
+               (_phone_tail(phone_digits),))
+    else:
+        r = q1("SELECT COUNT(*) n FROM messages")
+    return r["n"] if r else 0
 
 
 def last_message_for_phone(phone_digits: str) -> Optional[dict]:
@@ -178,11 +241,20 @@ def last_message_for_phone(phone_digits: str) -> Optional[dict]:
     if not tail:
         return None
     r = q1(
-        f"SELECT direction, text, media, ts FROM messages WHERE {_PHONE_MATCH} "
+        "SELECT direction, text, media, ts FROM messages WHERE phone_tail=? "
         "ORDER BY ts DESC LIMIT 1",
-        (f"%{tail}%",),
+        (tail,),
     )
     return dict(r) if r else None
+
+
+def full_phone_for_tail(tail: str) -> str:
+    """Telefone completo mais recente associado a um tail (p/ leads órfãos)."""
+    t = _phone_tail(tail)
+    if not t:
+        return ""
+    r = q1("SELECT phone FROM messages WHERE phone_tail=? ORDER BY ts DESC LIMIT 1", (t,))
+    return (r["phone"] if r else "") or ""
 
 
 def inbox_sig_for_phone(phone_digits: str) -> str:
@@ -200,6 +272,34 @@ def get_seen_sig(user_id: int, conv_id: str) -> Optional[str]:
     return r["sig"] if r else None
 
 
+def seen_map(user_id: int) -> dict[str, str]:
+    """Todas as assinaturas 'visto' de um usuário numa consulta só (p/ inbox)."""
+    return {r["conv_id"]: r["sig"]
+            for r in q("SELECT conv_id, sig FROM seen WHERE user_id=?", (user_id,))}
+
+
+def latest_per_phone(limit: int = 500) -> list[dict]:
+    """Última mensagem por telefone (1 linha por tail) — base p/ leads órfãos."""
+    rows = q(
+        "SELECT m.phone, m.phone_tail, m.text, m.direction, m.ts, m.name "
+        "FROM messages m JOIN ("
+        "  SELECT phone_tail, MAX(ts) mts FROM messages "
+        "  WHERE phone_tail IS NOT NULL AND phone_tail<>'' GROUP BY phone_tail"
+        ") g ON m.phone_tail=g.phone_tail AND m.ts=g.mts "
+        "ORDER BY m.ts DESC LIMIT ?",
+        (limit,),
+    )
+    seen: set[str] = set()
+    out: list[dict] = []
+    for r in rows:                       # dedup defensivo em empates de ts
+        t = r["phone_tail"]
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(dict(r))
+    return out
+
+
 def set_seen_sig(user_id: int, conv_id: str, sig: str) -> None:
     run(
         "INSERT INTO seen(user_id, conv_id, sig) VALUES(?,?,?) "
@@ -213,8 +313,9 @@ def unread_since_sig(phone_digits: str, sig: str) -> int:
     if not tail:
         return 0
     rows = q(
-        f"SELECT direction, text, ts FROM messages WHERE {_phone_like(tail)} "
+        "SELECT direction, text, ts FROM messages WHERE phone_tail=? "
         "ORDER BY ts ASC",
+        (tail,),
     )
     if not sig:
         last = rows[-1] if rows else None
@@ -249,6 +350,23 @@ def is_snoozed(user_id: int, conv_id: str) -> bool:
     except ValueError:
         run("DELETE FROM snooze WHERE user_id=? AND conv_id=?", (user_id, conv_id))
     return False
+
+
+def snoozed_set(user_id: int) -> set[str]:
+    """Conjunto de conv_ids ainda silenciados de um usuário (1 consulta)."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    out: set[str] = set()
+    for r in q("SELECT conv_id, until FROM snooze WHERE user_id=?", (user_id,)):
+        try:
+            until = _dt.datetime.fromisoformat((r["until"] or "").replace("Z", "+00:00"))
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=_dt.timezone.utc)
+            if until > now:
+                out.add(r["conv_id"])
+        except ValueError:
+            pass
+    return out
 
 
 def set_snooze(user_id: int, conv_id: str, until_iso: str) -> None:

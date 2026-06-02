@@ -62,20 +62,29 @@ _CONV_RE = _re.compile(r"^/api/conversations/([^/]+)")
 
 
 async def _seller_owns(owner_id, conv_id: str) -> bool:
-    """Vendedor só acessa negócios da própria carteira (fail-open em erro)."""
+    """Vendedor só acessa negócios da própria carteira (fail-CLOSED em erro)."""
     if settings.mock or not owner_id:
         return True
+    if not str(conv_id).isdigit():
+        # ids não numéricos (ex.: lead órfão 'wa_...') não pertencem a carteira
+        return False
     try:
         from ploomes_client import ploomes
         if ploomes is None:
-            return True
+            return False
         deal = await ploomes.deal_context(int(conv_id))
         return deal.get("OwnerId") == owner_id
-    except (ValueError, TypeError):
-        return True
     except Exception as e:  # noqa: BLE001
-        log.warning("checagem de posse falhou (%s): %s", conv_id, e)
-        return True
+        log.warning("checagem de posse falhou (%s): %s — negando", conv_id, e)
+        return False
+
+
+async def _enforce_owns(request: Request, conv_id) -> None:
+    """Bloqueia (403) se o usuário for vendedor e o negócio não for da carteira.
+    Usar nas rotas de ESCRITA que recebem o id no corpo/caminho."""
+    u = _user(request)
+    if u.get("role") == "seller" and not await _seller_owns(u.get("owner_id"), str(conv_id)):
+        raise HTTPException(403, "sem acesso a este cliente")
 
 
 @app.middleware("http")
@@ -166,7 +175,8 @@ def _save_msg(d: dict) -> None:
     db.save_message(neppo_id=d.get("id"), phone=d["phone"], direction=d["direction"],
                     text=d.get("text", ""), media=d.get("media_url", ""),
                     ct=d.get("content_type", "TEXT"), bot=d.get("bot"),
-                    name=d.get("name", ""), ts=str(d.get("createdAt") or ""))
+                    name=d.get("name", ""), ts=str(d.get("createdAt") or ""),
+                    agent_id=d.get("agent_id"))
 
 
 # -- gestão de usuários (admin) --------------------------------------------
@@ -256,6 +266,19 @@ async def admin_metrics(request: Request):
     _require_admin(request)
     return await repo.admin_metrics()
 
+
+@app.get("/api/admin/neppo-agents")
+async def admin_neppo_agents(request: Request):
+    """Vínculo vendedor (Ploomes) <-> agente (Neppo), lido do campo customizado.
+    Use para conferir se o mapeamento está correto antes de usar em métricas."""
+    _require_admin(request)
+    if settings.mock or not settings.ploomes_configured:
+        return {"linked": 0, "by_agent": {}, "mock": settings.mock}
+    from ploomes_client import ploomes
+    if ploomes is None:
+        return {"linked": 0, "by_agent": {}}
+    return await ploomes.neppo_agent_map()
+
 FEEDBACK_LOG: list[dict] = []  # Camada 4 — troque por persistência em banco
 
 # --- pub/sub em memória para SSE (tempo real) ------------------------------
@@ -290,6 +313,26 @@ async def conversations(request: Request, mode: str = "smart", q: str = "", day:
         mode=mode, query=q, day=day or None, owner_id=owner, user_id=u.get("id"),
     )
     return [front_conversation(c) for c in items]
+
+
+@app.get("/api/alerts")
+async def alerts(request: Request):
+    """Fila proativa: SLA de resposta, reativação (RFM) e negócios parados.
+    Escopo por carteira para vendedor; admin vê tudo."""
+    if not settings.mock and not settings.ploomes_configured:
+        return {"alerts": [], "count": 0, "by_kind": {}}
+    import alerts as alerts_mod
+    u = _user(request)
+    owner = u.get("owner_id") if u.get("role") == "seller" else None
+    items = await repo.list_conversations(
+        mode="smart", owner_id=owner, user_id=u.get("id"),
+    )
+    return alerts_mod.build_alerts(
+        items,
+        sla_minutes=settings.sla_first_reply_minutes,
+        reactivation_factor=settings.reactivation_factor,
+        stale_deal_days=settings.stale_deal_days,
+    )
 
 
 @app.get("/api/conversations/{conv_id}")
@@ -457,6 +500,18 @@ async def conversation_messages(conv_id: str):
     return await repo.client_messages(conv_id)
 
 
+class OrderDraftIn(BaseModel):
+    text: str = ""
+
+
+@app.post("/api/conversations/{conv_id}/order-draft")
+async def order_draft(conv_id: str, request: Request, body: OrderDraftIn):
+    """Lê o pedido do cliente (ou um texto colado) e devolve itens com preço
+    da tabela, prontos para virar uma cotação dry-run em /api/documents."""
+    await _enforce_owns(request, conv_id)
+    return await repo.build_order_draft(conv_id, body.text)
+
+
 @app.get("/api/products")
 async def products(q: str = ""):
     if settings.mock or not q:
@@ -473,7 +528,8 @@ async def products(q: str = ""):
 
 # -- criação gated de cotações/pedidos (dry-run -> confirmação) -------------
 @app.post("/api/documents")
-async def documents(req: DocRequest):
+async def documents(req: DocRequest, request: Request):
+    await _enforce_owns(request, req.conversation_id)
     from repository import _resolve_contact
     cid, _, name = await _resolve_contact(req.conversation_id)
     if cid is None:
@@ -481,6 +537,26 @@ async def documents(req: DocRequest):
     if req.dry_run:
         return doc_preview(cid, name, req)
     return await doc_create(cid, name, req)
+
+
+class CreateDealIn(BaseModel):
+    owner_id: int | None = None     # força um dono; senão usa agente/requisitante
+    dry_run: bool = True
+
+
+@app.post("/api/conversations/{conv_id}/create-deal")
+async def create_deal(conv_id: str, request: Request, body: CreateDealIn):
+    """Transforma um lead órfão (wa_...) em negócio no funil de entrada.
+    dry_run=true só mostra o que seria criado; false grava no Ploomes."""
+    u = _user(request)
+    req_owner = u.get("owner_id") if u.get("role") == "seller" else None
+    res = await repo.create_deal_from_orphan(
+        conv_id, owner_id=body.owner_id, requesting_owner_id=req_owner,
+        dry_run=body.dry_run,
+    )
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "falha ao criar negócio"))
+    return res
 
 
 class InteractionIn(BaseModel):
@@ -491,7 +567,8 @@ class InteractionIn(BaseModel):
 
 
 @app.post("/api/interactions")
-async def create_interaction(payload: InteractionIn):
+async def create_interaction(payload: InteractionIn, request: Request):
+    await _enforce_owns(request, payload.conversation_id)
     res = await repo.add_interaction(payload.conversation_id, payload.type_id,
                                      payload.content, payload.title)
     if not res.get("ok"):
@@ -504,14 +581,22 @@ async def list_templates():
     import intents as it
     import templates as tpl
     custom = tpl.load_custom()
+    fb = db.feedback_by_intent()
     out = []
     for intent in it.INTENTS:
         iid = intent["id"]
+        stats = fb.get(iid, {"used": 0, "edited": 0, "ignored": 0,
+                             "total": 0, "acceptance": None})
         out.append({
             "id": iid, "label": intent["label"],
             "text": custom.get(iid) or tpl.DEFAULT_TEMPLATES.get(iid, ""),
             "customized": iid in custom,
+            "feedback": stats,
         })
+    # piores (mais ignorados, com dados) primeiro — chamam atenção pra revisão
+    out.sort(key=lambda t: (t["feedback"]["total"] == 0,
+                            t["feedback"]["acceptance"]
+                            if t["feedback"]["acceptance"] is not None else 1))
     return {"templates": out,
             "placeholders": ["contato", "empresa", "pedido", "status", "entrega",
                              "rastreio", "transportadora", "cidade", "produto",
@@ -567,15 +652,17 @@ class StageIn(BaseModel):
 
 
 @app.post("/api/deals/{deal_id}/stage")
-async def move_stage(deal_id: int, payload: StageIn):
+async def move_stage(deal_id: int, payload: StageIn, request: Request):
     if settings.mock:
         return {"ok": False, "error": "modo mock"}
+    await _enforce_owns(request, deal_id)
     from ploomes_client import ploomes
     try:
         await ploomes.update_deal(deal_id, {"StageId": payload.stage_id})
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(502, f"Ploomes: {e}") from e
+        log.error("Ploomes update_deal(stage) falhou (%s): %s", deal_id, e)
+        raise HTTPException(502, "falha ao mover o negócio no Ploomes") from e
 
 
 class OwnerIn(BaseModel):
@@ -583,15 +670,17 @@ class OwnerIn(BaseModel):
 
 
 @app.post("/api/deals/{deal_id}/owner")
-async def assign_owner(deal_id: int, payload: OwnerIn):
+async def assign_owner(deal_id: int, payload: OwnerIn, request: Request):
     if settings.mock:
         return {"ok": False, "error": "modo mock"}
+    await _enforce_owns(request, deal_id)
     from ploomes_client import ploomes
     try:
         await ploomes.update_deal(deal_id, {"OwnerId": payload.owner_id})
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(502, f"Ploomes: {e}") from e
+        log.error("Ploomes update_deal(owner) falhou (%s): %s", deal_id, e)
+        raise HTTPException(502, "falha ao reatribuir o negócio no Ploomes") from e
 
 
 # -- tempo real (Server-Sent Events) ---------------------------------------
@@ -623,7 +712,8 @@ class SendIn(BaseModel):
 
 
 @app.post("/api/send")
-async def send(payload: SendIn):
+async def send(payload: SendIn, request: Request):
+    await _enforce_owns(request, payload.conversation_id)
     # eco local otimista (best-effort; não bloqueia o envio se faltar no cache)
     await repo.append_seller_message(payload.conversation_id, payload.text, _now())
     out = {"ok": True, "neppo": settings.neppo_enabled}
@@ -638,7 +728,8 @@ async def send(payload: SendIn):
         try:
             await client.send_message(phone, payload.text)
         except Exception as e:
-            raise HTTPException(502, f"Neppo: {e}") from e
+            log.error("Neppo send_message falhou (%s): %s", phone, e)
+            raise HTTPException(502, "falha ao enviar a mensagem no WhatsApp") from e
         out["phone"] = phone
         db.save_message(phone=phone, direction="out", text=payload.text,
                         ts=dt.datetime.now().isoformat())
@@ -664,12 +755,18 @@ async def feedback(payload: FeedbackIn, request: Request):
 # --------------------------------------------------------------------------
 def _valid_webhook(request: Request) -> bool:
     """Confere a chave do webhook (query `key` ou header X-Webhook-Key).
-    Se nenhuma chave estiver configurada, libera (mas registra aviso)."""
-    if not settings.webhook_protected:
-        log.warning("webhook sem chave configurada — defina WEBHOOK_VALIDATION_KEY")
+
+    Seguro por padrão: sem chave configurada, RECUSA — a menos que esteja em
+    modo mock ou WEBHOOK_ALLOW_INSECURE=1 (só para desenvolvimento local)."""
+    if settings.webhook_protected:
+        key = request.query_params.get("key") or request.headers.get("X-Webhook-Key", "")
+        return key == settings.webhook_validation_key
+    if settings.mock or settings.webhook_allow_insecure:
+        log.warning("webhook sem chave — liberado (mock/insecure, só dev)")
         return True
-    key = request.query_params.get("key") or request.headers.get("X-Webhook-Key", "")
-    return key == settings.webhook_validation_key
+    log.error("webhook RECUSADO: defina WEBHOOK_VALIDATION_KEY (ou "
+              "WEBHOOK_ALLOW_INSECURE=1 só em dev)")
+    return False
 
 
 @app.get("/webhooks/neppo")
@@ -689,9 +786,11 @@ async def neppo_incoming(request: Request):
     if msg is None:
         return {"ignored": True}
     conv = await repo.append_client_message(msg["phone"], msg["text"], msg["name"], _now())
-    # persiste no banco (histórico permanente, busca, não-lidas)
+    # persiste no banco (histórico permanente, busca, não-lidas). neppo_id
+    # dedupa reentregas do webhook (INSERT OR IGNORE).
     db.save_message(phone=msg["phone"], direction="in", text=msg["text"],
-                    name=msg.get("name", ""), ts=dt.datetime.now().isoformat())
+                    name=msg.get("name", ""), ts=dt.datetime.now().isoformat(),
+                    neppo_id=msg.get("id"))
     if conv:
         repo.invalidate_ai_cache(conv.id)
     # avisa as telas abertas em tempo real (SSE)
@@ -710,6 +809,29 @@ async def ploomes_changed(request: Request):
         from ploomes_client import ploomes
         ploomes.invalidate_deal(int(deal_id))   # cache fica fresco
     return {"ok": True}
+
+
+@app.on_event("shutdown")
+async def _close_clients():
+    """Fecha os clientes HTTP (Ploomes/Neppo) ao desligar — evita leaks."""
+    try:
+        from ploomes_client import ploomes
+        if ploomes is not None:
+            await ploomes.aclose()
+    except Exception as e:  # noqa: BLE001
+        log.debug("aclose Ploomes: %s", e)
+    try:
+        from neppo_client import _client as _neppo
+        if _neppo is not None:
+            await _neppo.aclose()
+    except Exception as e:  # noqa: BLE001
+        log.debug("aclose Neppo: %s", e)
+    try:
+        import ai as _ai
+        if getattr(_ai, "_http", None) is not None:
+            await _ai._http.aclose()
+    except Exception as e:  # noqa: BLE001
+        log.debug("aclose IA: %s", e)
 
 
 @app.get("/api/health")

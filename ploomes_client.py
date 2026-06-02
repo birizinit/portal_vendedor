@@ -158,6 +158,34 @@ class PloomesClient:
         self._cache.set(key, ct)
         return ct
 
+    async def contact_by_phone(self, phone: str) -> Optional[dict]:
+        """Procura um contato cadastrado pelo telefone (últimos 8 dígitos).
+
+        Usado para descobrir que um 'lead sem cadastro' do WhatsApp na verdade
+        já é um cliente no Ploomes (só sem negócio aberto). Cache positivo e
+        negativo para não repetir a busca a cada aba aberta."""
+        digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+        if len(digits) < 8:
+            return None
+        tail = digits[-8:]
+        key = f"contact_phone:{tail}"
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached or None
+        contact = None
+        try:
+            data = await self._get("/Contacts", params={
+                "$filter": f"Phones/any(p: contains(p/PhoneNumber,'{tail}'))",
+                "$expand": "OtherProperties,Phones,City,State",
+                "$top": 1,
+            })
+            contact = (data.get("value") or [None])[0]
+        except Exception as e:  # noqa: BLE001  — falha não derruba o fluxo
+            log.warning("busca de contato por telefone falhou (%s): %s", tail, e)
+            contact = None
+        self._cache.set(key, contact or {})   # cacheia também o "não achou"
+        return contact or None
+
     async def orders_for_contact(self, contact_id: int, top: int = 20) -> list[dict]:
         key = f"orders:{contact_id}"
         cached = self._cache.get(key)
@@ -192,6 +220,7 @@ class PloomesClient:
         data = await self._get("/InteractionRecords", params={
             "$filter": f"ContactId eq {contact_id}",
             "$orderby": "Date desc",
+            "$expand": "OtherProperties",   # traz dados de sessão do Neppo
             "$top": top,
         })
         return data.get("value", [])
@@ -236,6 +265,27 @@ class PloomesClient:
         """Registra uma interação (anotação/ligação/WhatsApp) no CRM."""
         return await self._post("/InteractionRecords", payload)
 
+    async def create_contact(self, payload: dict) -> dict:
+        """Cria um contato (cliente) — usado quando um lead de WhatsApp ainda
+        não existe no Ploomes e vamos abrir um negócio pra ele."""
+        return await self._post("/Contacts", payload)
+
+    async def create_deal(self, payload: dict) -> dict:
+        """Cria um negócio (deal). Use só após preview/confirmação."""
+        return await self._post("/Deals", payload)
+
+    async def pipelines(self) -> list[dict]:
+        """Funis (pipelines) com cache — p/ achar 'Entradas e Prospecção'."""
+        cached = self._cache.get("pipelines")
+        if cached is not None:
+            return cached
+        data = await self._get("/Deals@Pipelines", params={
+            "$select": "Id,Name", "$top": 200,
+        })
+        rows = data.get("value", [])
+        self._cache.set("pipelines", rows)
+        return rows
+
     async def stages(self) -> list[dict]:
         """Estágios do funil (todos os pipelines), com cache."""
         cached = self._cache.get("stages")
@@ -268,6 +318,47 @@ class PloomesClient:
             if len(rows) < 300:
                 break
         self._cache.set("users", out)
+        return out
+
+    async def neppo_agent_map(self) -> dict:
+        """Mapa vendedor (Ploomes) <-> agente (Neppo), lido do campo customizado
+        'Id do usuário (Neppo)' na entidade User. Cacheado.
+
+        Retorna {"by_agent": {neppo_id: {id,name}}, "by_user": {user_id: neppo_id},
+        "field_key": <key>, "linked": <n>}.
+        """
+        cached = self._cache.get("neppo_agents")
+        if cached is not None:
+            return cached
+        from other_properties import catalog, value_by_key
+        key = catalog.find_key("id do usu", "neppo")   # "Id do usuário (Neppo)"
+        out: dict = {"by_agent": {}, "by_user": {}, "field_key": key, "linked": 0}
+        if not key:
+            log.warning("campo 'Id do usuário (Neppo)' não encontrado no catálogo")
+            self._cache.set("neppo_agents", out)
+            return out
+        skip = 0
+        while True:
+            data = await self._get("/Users", params={
+                "$expand": "OtherProperties", "$top": 300, "$skip": skip,
+            })
+            rows = data.get("value", [])
+            if not rows:
+                break
+            for u in rows:
+                raw = value_by_key(u, key)
+                try:
+                    aid = int(raw) if raw is not None else None
+                except (TypeError, ValueError):
+                    aid = None
+                if aid is not None:
+                    out["by_agent"][str(aid)] = {"id": u.get("Id"), "name": u.get("Name")}
+                    out["by_user"][str(u.get("Id"))] = aid
+            skip += len(rows)
+            if len(rows) < 300:
+                break
+        out["linked"] = len(out["by_agent"])
+        self._cache.set("neppo_agents", out)
         return out
 
     async def update_deal(self, deal_id: int, patch: dict) -> Any:

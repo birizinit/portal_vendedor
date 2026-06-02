@@ -59,6 +59,13 @@ def t_disponibilidade(c: Conversation) -> str:
             f"estoque e já te falo. ⟨consultar ERP⟩")
 
 
+def t_pedido_itens(c: Conversation) -> str:
+    return (f"Perfeito, {_first(c.contact)}! Recebi seu pedido com os itens e as "
+            f"quantidades. Já vou montar o orçamento na sua tabela e te retorno "
+            f"com os valores e o prazo de entrega. Confirma que é para o CNPJ/"
+            f"endereço de sempre? ⟨conferir itens e montar a cotação⟩")
+
+
 def t_cotacao_preco(c: Conversation) -> str:
     o = c.order
     if o and o.unit:
@@ -96,6 +103,7 @@ def t_saudacao(c: Conversation) -> str:
 
 
 TEMPLATES: dict[str, Callable[[Conversation], str]] = {
+    "pedido_itens": t_pedido_itens,
     "status_pedido": t_status_pedido,
     "prazo_entrega": t_prazo_entrega,
     "disponibilidade": t_disponibilidade,
@@ -115,6 +123,9 @@ TEMPLATES: dict[str, Callable[[Conversation], str]] = {
 
 # Versão estática (com placeholders) mostrada no editor como ponto de partida.
 DEFAULT_TEMPLATES: dict[str, str] = {
+    "pedido_itens": "Perfeito, {contato}! Recebi seu pedido com os itens e "
+                    "quantidades. Já monto o orçamento na sua tabela e retorno "
+                    "com valores e prazo. Confirma o CNPJ/endereço de sempre?",
     "status_pedido": "Oi, {contato}! O pedido {pedido} está em \"{status}\". "
                      "Previsão de entrega em {cidade}: {entrega}. Rastreio: {rastreio}.",
     "prazo_entrega": "Oi, {contato}! Seu pedido {pedido} tem previsão de entrega "

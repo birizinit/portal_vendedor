@@ -37,6 +37,21 @@ class Settings:
     neppo_group_conf_id: int = int(os.getenv("NEPPO_GROUP_CONF_ID", "1"))
     neppo_user_id: int = int(os.getenv("NEPPO_USER_ID", "0"))
 
+    # ---- Alertas proativos ----
+    # minutos aguardando resposta do cliente até virar alerta de SLA
+    sla_first_reply_minutes: int = int(os.getenv("CORTEX_SLA_MINUTES", "15"))
+    # dias sem compra / ciclo habitual >= este fator => alerta de reativação
+    reactivation_factor: float = float(os.getenv("CORTEX_REACTIVATION_FACTOR", "1.3"))
+    # dias parado no mesmo estágio do funil até virar alerta
+    stale_deal_days: int = int(os.getenv("CORTEX_STALE_DEAL_DAYS", "7"))
+
+    # ---- Funil de entrada (leads de WhatsApp viram negócio aqui) ----
+    intake_pipeline_name: str = os.getenv("CORTEX_INTAKE_PIPELINE", "Entradas e Prospecção")
+    # estágio inicial; vazio = primeiro estágio (menor Ordination) do funil
+    intake_stage_name: str = os.getenv("CORTEX_INTAKE_STAGE", "")
+    # "motivo"/origem registrado no negócio criado a partir do WhatsApp
+    intake_source: str = os.getenv("CORTEX_INTAKE_SOURCE", "WhatsApp (Neppo)")
+
     # ---- OpenRouter (copiloto de IA — modelos :free disponíveis) ----
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
     openrouter_base_url: str = os.getenv(
@@ -46,6 +61,9 @@ class Settings:
 
     # chave usada para validar que o webhook veio mesmo do provedor
     webhook_validation_key: str = os.getenv("WEBHOOK_VALIDATION_KEY", "troque-esta-chave")
+    # libera webhook sem chave (SÓ para desenvolvimento local) — em produção
+    # deixe 0 e configure WEBHOOK_VALIDATION_KEY
+    webhook_allow_insecure_raw: str = os.getenv("WEBHOOK_ALLOW_INSECURE", "")
 
     # origens permitidas no CORS (separadas por vírgula); vazio = só localhost
     cors_origins_raw: str = os.getenv("CORS_ORIGINS", "")
@@ -63,6 +81,11 @@ class Settings:
         """True quando há uma chave de webhook configurada (não a padrão)."""
         return bool(self.webhook_validation_key
                     and self.webhook_validation_key != "troque-esta-chave")
+
+    @property
+    def webhook_allow_insecure(self) -> bool:
+        """Permite webhook sem chave (apenas dev). Produção deve ficar False."""
+        return self.webhook_allow_insecure_raw.strip().lower() in ("1", "true", "yes")
 
     @property
     def mock(self) -> bool:

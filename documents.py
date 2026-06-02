@@ -105,14 +105,17 @@ async def create(contact_id: int, contact_name: str, req: DocRequest) -> dict:
     if ploomes is None:
         return {"ok": False, "error": "Ploomes não configurado"}
 
+    import logging
     payload = build_payload(contact_id, req)
     try:
         if req.kind == "order":
             result = await ploomes.create_order(payload)
         else:
             result = await ploomes.create_quote(payload)
-    except Exception as e:  # noqa: BLE001 — devolve o erro pro front decidir
-        return {"ok": False, "error": str(e), "payload": payload}
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("cortex").error("falha ao criar %s no Ploomes: %s",
+                                          req.kind, e)
+        return {"ok": False, "error": "falha ao criar o documento no Ploomes"}
 
     created = (result.get("value") or [result])[0] if isinstance(result, dict) else result
     new_id = created.get("Id") if isinstance(created, dict) else None
