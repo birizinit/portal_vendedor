@@ -1252,6 +1252,19 @@ function findConvByContact(phone, name){
   return DATA.find(c=> (np && (c.phone||"").replace(/\D/g,"").includes(np.slice(-8)))
     || (nn.length>2 && (norm(c.contact||"").includes(nn)||norm(c.name||"").includes(nn))) );
 }
+let listRefreshTimer = null;
+function scheduleListRefresh(){
+  if(listRefreshTimer) clearTimeout(listRefreshTimer);
+  listRefreshTimer = setTimeout(async ()=>{
+    listRefreshTimer = null;
+    const keepId = state.activeId;
+    try{
+      await loadConversations(false);
+      if(keepId && DATA.some(c=>c.id===keepId)) state.activeId = keepId;
+      renderList();
+    }catch(_){}
+  }, 600);
+}
 function initSSE(){
   if(!window.EventSource) return;
   try{
@@ -1260,30 +1273,32 @@ function initSSE(){
     es.onerror=()=>{ sseOn=false; };
     es.onmessage=(e)=>{
       let ev; try{ ev=JSON.parse(e.data); }catch(_){ return; }
-      if(!ev || ev.type!=="message") return;
+      if(!ev) return;
+      if(ev.type==="agent"){
+        if(document.getElementById("night-overlay")?.classList.contains("show")) renderNightTower();
+        if(ev.conv_id===state.activeId){
+          loadAgentInfo(state.activeId).then(()=>renderAgentBanner());
+          if(ev.action==="sent" && state.threadView==="conversa"){
+            const c=DATA.find(x=>x.id===state.activeId);
+            if(c) refreshMessages(c, true);
+          }
+        }
+        announceLive(`IA: ${ev.action||""} ${ev.name||""}`.trim());
+        return;
+      }
+      if(ev.type!=="message") return;
       const m=findConvByContact(ev.phone, ev.name);
-      if(!m) return;
-      if(m.id===state.activeId && state.threadView==="conversa") refreshMessages(m, true);
-      else bumpUnread(m.id);
+      if(m){
+        if(m.id===state.activeId && state.threadView==="conversa") refreshMessages(m, true);
+        else bumpUnread(m.id);
+      }
+      scheduleListRefresh();
       refreshAlertsBadgeThrottled();
-      const title = ev.name || m.name || "Cliente";
+      const title = ev.name || (m && m.name) || "Cliente";
       const body = (ev.text || "").slice(0, 140);
       announceLive("Nova mensagem de " + title);
       if(document.hidden) notifyDesktop(title, body);
-      return;
     };
-    if(ev && ev.type==="agent"){
-      if(document.getElementById("night-overlay")?.classList.contains("show")) renderNightTower();
-      if(ev.conv_id===state.activeId){
-        loadAgentInfo(state.activeId).then(()=>renderAgentBanner());
-        if(ev.action==="sent" && state.threadView==="conversa"){
-          const c=DATA.find(x=>x.id===state.activeId);
-          if(c) refreshMessages(c, true);
-        }
-      }
-      announceLive(`IA: ${ev.action||""} ${ev.name||""}`.trim());
-      return;
-    }
   }catch(e){}
 }
 
