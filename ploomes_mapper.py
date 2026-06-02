@@ -192,6 +192,7 @@ def conversation_from_deal(deal: dict, *, detail: Optional[dict] = None) -> Conv
         segment=segment,
         days_without_purchase=days_no,
         buy_frequency_days=freq_days,
+        days_in_stage=_int_or_none(deal.get("DaysInStage") or src.get("DaysInStage")),
         owner=owner,
         stage=stage_display,
         stage_id=deal.get("StageId") or src.get("StageId"),
@@ -548,6 +549,32 @@ def client_profile_from(contact: dict) -> ClientProfile:
 _INTERACTION_KIND = {1: "note", 3: "note", 4: "email", 7: "whatsapp", 2: "email"}
 
 
+def _neppo_session_summary(rec: dict) -> str:
+    """Resumo curto da sessão Neppo a partir dos OtherProperties da interação
+    (status, canal, agente, tempo de atendimento). Vazio se não houver."""
+    if not rec.get("OtherProperties"):
+        return ""
+    props = op.extract(rec)
+    bits: list[str] = []
+    status = op.get_like(props, "status", "sess", "neppo")
+    if status:
+        bits.append(str(status))
+    canal = op.get_like(props, "canal", "neppo")
+    if canal:
+        bits.append(str(canal))
+    agente = (op.get_like(props, "agente", "sess", "neppo")
+              or op.get_like(props, "agente", "envio", "neppo"))
+    if agente:
+        bits.append(f"agente {agente}")
+    tempo = op.get_like(props, "tempo", "atendimento", "neppo")
+    if tempo:
+        bits.append(f"{tempo}s atend.")
+    protocolo = op.get_like(props, "protocolo", "neppo")
+    if protocolo:
+        bits.append(f"protocolo {protocolo}")
+    return " · ".join(bits)
+
+
 def timeline_item_from_interaction(rec: dict) -> TimelineItem:
     type_id = rec.get("TypeId")
     kind = _INTERACTION_KIND.get(type_id, "interaction")
@@ -557,10 +584,17 @@ def timeline_item_from_interaction(rec: dict) -> TimelineItem:
         import re
         content = re.sub(r"<[^>]+>", " ", content)
         content = re.sub(r"\s+", " ", content).strip()
+    title = str(rec.get("Title") or rec.get("EmailSubject") or "Interação")
+    # enriquecimento: dados de sessão do Neppo (se a interação tiver)
+    session = _neppo_session_summary(rec)
+    if session:
+        kind = "whatsapp"
+        title = "Sessão WhatsApp (Neppo)"
+        content = f"{session} — {content}".strip(" —") if content else session
     return TimelineItem(
         kind=kind,
-        title=str(rec.get("Title") or rec.get("EmailSubject") or "Interação"),
+        title=title,
         content=content[:500],
         date=str(rec.get("Date") or rec.get("CreateDate") or ""),
-        source="ploomes",
+        source="neppo" if session else "ploomes",
     )

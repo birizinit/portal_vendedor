@@ -51,6 +51,23 @@ def clean_message_text(raw: Any) -> str:
     return s
 
 
+def _agent_id_of(m: dict) -> Optional[int]:
+    """Id do agente Neppo que enviou a mensagem (só faz sentido em 'out').
+    Tenta vários formatos do payload — best-effort; None se não houver."""
+    if (m.get("sendBy") or "").lower() == "user":
+        return None                      # mensagem do cliente, não tem agente
+    for cand in (m.get("agentId"), m.get("userId"),
+                 (m.get("agent") or {}).get("id") if isinstance(m.get("agent"), dict) else None,
+                 ((m.get("session") or {}).get("agent") or {}).get("id")
+                 if isinstance((m.get("session") or {}).get("agent"), dict) else None):
+        try:
+            if cand is not None:
+                return int(cand)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def normalize_phone(phone: str) -> str:
     digits = re.sub(r"\D", "", phone or "")
     if not digits:
@@ -65,6 +82,7 @@ class NeppoClient:
         self._http = httpx.AsyncClient(timeout=25.0)
         self._token: Optional[str] = None
         self._token_expires: float = 0.0
+        self._token_lock = asyncio.Lock()
         self._last_page: int = 0
         self._last_page_at: float = 0.0
 
@@ -92,7 +110,11 @@ class NeppoClient:
     async def get_token(self) -> str:
         if self._token and time.monotonic() < self._token_expires:
             return self._token
-        return await self._fetch_token()
+        async with self._token_lock:
+            # re-checa dentro do lock: outra corrotina pode já ter renovado
+            if self._token and time.monotonic() < self._token_expires:
+                return self._token
+            return await self._fetch_token()
 
     async def _api_post(self, path: str, body: dict) -> dict:
         token = await self.get_token()
@@ -230,6 +252,7 @@ class NeppoClient:
             "bot": (m.get("sendBy") or "").lower() in ("bot", "system"),
             "name": user.get("displayName") or "",
             "createdAt": m.get("createdAt"),
+            "agent_id": _agent_id_of(m),
         }
 
     async def backfill(self, save_fn, pages: int = 100, size: int = 100) -> int:
@@ -308,6 +331,13 @@ def _phone_from_content(content: dict) -> str:
     return ""
 
 
+def _as_int(v: Any) -> Optional[int]:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_webhook(payload: dict) -> Optional[dict]:
     """Normaliza webhook Neppo (MESSAGE / SESSION) ou payload simples."""
     try:
@@ -323,7 +353,9 @@ def parse_webhook(payload: dict) -> Optional[dict]:
                 name = ""
                 if isinstance(user, dict):
                     name = str(user.get("displayName") or user.get("name") or "")
-                return {"phone": phone, "text": str(text), "name": name}
+                mid = content.get("id") or payload.get("id")
+                return {"phone": phone, "text": str(text), "name": name,
+                        "id": _as_int(mid)}
 
         phone = payload.get("from") or payload.get("phone") or payload.get("phoneNumber")
         text = payload.get("text")
@@ -337,6 +369,7 @@ def parse_webhook(payload: dict) -> Optional[dict]:
                 "phone": str(phone),
                 "text": str(text),
                 "name": str(payload.get("contactName") or payload.get("name") or ""),
+                "id": _as_int(payload.get("id")),
             }
     except (json.JSONDecodeError, AttributeError, TypeError):
         return None

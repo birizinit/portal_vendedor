@@ -62,6 +62,7 @@ class Conversation(BaseModel):
     messages: list[Message] = []
     days_without_purchase: Optional[int] = None
     buy_frequency_days: Optional[int] = None
+    days_in_stage: Optional[int] = None      # dias parado no estágio atual do funil
     # metadados de inbox (WhatsApp + leitura)
     awaiting_reply: bool = False
     unread_count: int = 0

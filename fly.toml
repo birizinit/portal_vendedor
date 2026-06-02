@@ -1,0 +1,28 @@
+# fly.toml app configuration file generated for portal-vendedor on 2026-06-02T03:00:35Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'portal-vendedor'
+primary_region = 'gru'
+
+[build]
+
+[env]
+  CORTEX_DATA_DIR = '/data'
+  SECURE_COOKIES = '1'
+
+[[mounts]]
+  source = 'cortex_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'

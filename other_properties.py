@@ -66,6 +66,16 @@ class FieldCatalog:
     def key(self, name: str) -> Optional[str]:
         return self._name_to_key.get(name)
 
+    def find_key(self, *substrings: str) -> Optional[str]:
+        """FieldKey do primeiro campo cujo nome contém TODOS os trechos
+        (case-insensitive). Tolera acento/variações de rótulo."""
+        subs = [s.lower() for s in substrings]
+        for key, nm in self._key_to_name.items():
+            n = (nm or "").lower()
+            if all(s in n for s in subs):
+                return key
+        return None
+
     def __len__(self) -> int:
         return len(self._key_to_name)
 
@@ -112,6 +122,27 @@ def get(props: dict[str, Any], *names: str, default: Any = None) -> Any:
         if n in props and props[n] not in (None, ""):
             return props[n]
     return default
+
+
+def get_like(props: dict[str, Any], *substrings: str, default: Any = None) -> Any:
+    """Valor do primeiro campo cujo NOME contém todos os trechos (sem exigir
+    rótulo exato). Útil p/ campos do Neppo com nomes longos e acentuados."""
+    subs = [s.lower() for s in substrings]
+    for name, val in props.items():
+        n = (name or "").lower()
+        if all(s in n for s in subs) and val not in (None, "", []):
+            return val
+    return default
+
+
+# valor cru de um OtherProperty por FieldKey (sem resolver nome) — p/ ids Neppo
+def value_by_key(item: dict, field_key: str) -> Any:
+    if not field_key:
+        return None
+    for opx in item.get("OtherProperties") or []:
+        if opx.get("FieldKey") == field_key:
+            return _value_of(opx)
+    return None
 
 
 # ---------------------------------------------------------------------------

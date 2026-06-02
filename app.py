@@ -34,6 +34,8 @@ from documents import DocRequest, preview as doc_preview, create as doc_create
 import repository as repo
 import auth
 import db
+import reports as reports_mod
+import deps
 
 import logging
 logging.basicConfig(level=logging.INFO,
@@ -52,233 +54,44 @@ if _seed_pwd:
     print(f"\n[Cortex] Admin criado: {auth.ADMIN_EMAIL} / senha: {_seed_pwd}"
           f"  (troque após o primeiro login)\n")
 
-# rotas que não exigem login
-_PUBLIC = {"/login", "/api/login", "/api/logout", "/logo.png",
-           "/favicon.ico", "/api/health"}
-
-
-import re as _re
-_CONV_RE = _re.compile(r"^/api/conversations/([^/]+)")
-
-
-async def _seller_owns(owner_id, conv_id: str) -> bool:
-    """Vendedor só acessa negócios da própria carteira (fail-open em erro)."""
-    if settings.mock or not owner_id:
-        return True
-    try:
-        from ploomes_client import ploomes
-        if ploomes is None:
-            return True
-        deal = await ploomes.deal_context(int(conv_id))
-        return deal.get("OwnerId") == owner_id
-    except (ValueError, TypeError):
-        return True
-    except Exception as e:  # noqa: BLE001
-        log.warning("checagem de posse falhou (%s): %s", conv_id, e)
-        return True
-
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    path = request.url.path
-    if path in _PUBLIC or path.startswith("/webhooks/"):
-        return await call_next(request)
-    user = auth.user_for_token(request.cookies.get("cortex_session"))
-    if user is None:
-        if path.startswith("/api/"):
-            return JSONResponse({"detail": "não autenticado"}, status_code=401)
-        return RedirectResponse("/login")
-    request.state.user = user
-    # vendedor: bloqueia acesso a cliente fora da carteira
-    if user.get("role") == "seller":
-        m = _CONV_RE.match(path)
-        if m and not await _seller_owns(user.get("owner_id"), m.group(1)):
-            return JSONResponse({"detail": "sem acesso a este cliente"}, status_code=403)
-    return await call_next(request)
+app.middleware("http")(deps.auth_middleware)
 
 
 def _user(request: Request) -> dict:
-    return getattr(request.state, "user", {}) or {}
+    return deps.user(request)
 
 
-@app.get("/login")
-async def login_page():
-    from paths import data_dir
-    return FileResponse(str(data_dir() / "static" / "login.html"))
-
-
-class LoginIn(BaseModel):
-    email: str
-    password: str
-
-
-import time as _time
-_login_fails: dict[str, list] = {}   # proteção simples contra força bruta
-
-
-def _throttled(key: str) -> bool:
-    now = _time.monotonic()
-    arr = [t for t in _login_fails.get(key, []) if now - t < 300]
-    _login_fails[key] = arr
-    return len(arr) >= 8
-
-
-@app.post("/api/login")
-async def api_login(payload: LoginIn, request: Request):
-    key = (request.client.host if request.client else "?") + "|" + payload.email.lower()
-    if _throttled(key):
-        raise HTTPException(429, "muitas tentativas — aguarde alguns minutos")
-    token = auth.login(payload.email, payload.password)
-    if not token:
-        _login_fails.setdefault(key, []).append(_time.monotonic())
-        log.warning("login falhou para %s", payload.email)
-        raise HTTPException(401, "e-mail ou senha inválidos")
-    _login_fails.pop(key, None)
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie("cortex_session", token, httponly=True, samesite="lax",
-                    secure=settings.secure_cookies, max_age=auth.SESSION_DAYS * 86400)
-    return resp
-
-
-@app.post("/api/logout")
-async def api_logout(request: Request):
-    auth.logout(request.cookies.get("cortex_session"))
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie("cortex_session")
-    return resp
-
-
-@app.get("/api/me")
-async def api_me(request: Request):
-    u = _user(request)
-    return {"name": u.get("name"), "email": u.get("email"),
-            "role": u.get("role"), "owner_id": u.get("owner_id")}
+async def _enforce_owns(request: Request, conv_id) -> None:
+    await deps.enforce_owns(request, conv_id)
 
 
 def _require_admin(request: Request) -> dict:
-    u = _user(request)
-    if u.get("role") != "admin":
-        raise HTTPException(403, "acesso restrito ao administrador")
-    return u
+    return deps.require_admin(request)
 
 
-def _save_msg(d: dict) -> None:
-    db.save_message(neppo_id=d.get("id"), phone=d["phone"], direction=d["direction"],
-                    text=d.get("text", ""), media=d.get("media_url", ""),
-                    ct=d.get("content_type", "TEXT"), bot=d.get("bot"),
-                    name=d.get("name", ""), ts=str(d.get("createdAt") or ""))
+from routers import register
 
-
-# -- gestão de usuários (admin) --------------------------------------------
-@app.get("/api/admin/users")
-async def admin_users(request: Request):
-    _require_admin(request)
-    return auth.list_users()
-
-
-class NewUser(BaseModel):
-    email: str
-    name: str
-    password: str
-    role: str = "seller"
-    owner_id: int | None = None
-
-
-@app.post("/api/admin/users")
-async def admin_create_user(request: Request, payload: NewUser):
-    _require_admin(request)
-    if auth.user_by_email(payload.email):
-        raise HTTPException(409, "e-mail já cadastrado")
-    uid = auth.create_user(payload.email, payload.name, payload.password,
-                           payload.role, payload.owner_id)
-    return {"ok": True, "id": uid}
-
-
-class PwdIn(BaseModel):
-    password: str
-
-
-@app.post("/api/admin/users/{user_id}/password")
-async def admin_reset_pwd(request: Request, user_id: int, payload: PwdIn):
-    _require_admin(request)
-    auth.set_password(user_id, payload.password)
-    return {"ok": True}
-
-
-class ActiveIn(BaseModel):
-    active: bool
-
-
-@app.post("/api/admin/users/{user_id}/active")
-async def admin_set_active(request: Request, user_id: int, payload: ActiveIn):
-    u = _require_admin(request)
-    if user_id == u.get("id") and not payload.active:
-        raise HTTPException(400, "você não pode desativar a si mesmo")
-    auth.set_active(user_id, payload.active)
-    return {"ok": True}
-
-
-@app.post("/api/password")
-async def change_my_password(request: Request, payload: PwdIn):
-    u = _user(request)
-    auth.set_password(u["id"], payload.password)
-    return {"ok": True}
-
-
-# -- backfill do WhatsApp para o banco (admin) -----------------------------
-@app.post("/api/admin/backfill")
-async def admin_backfill(request: Request, pages: int = 200):
-    _require_admin(request)
-    if settings.mock or not settings.neppo_enabled:
-        raise HTTPException(503, "Neppo não configurado")
-    from neppo_client import get_neppo
-    cli = get_neppo()
-
-    async def job():
-        try:
-            n = await cli.backfill(_save_msg, pages=pages)
-            db.set_meta("backfill", f"{n} msgs varridas em {dt.datetime.now().isoformat()}")
-        except Exception as e:  # noqa
-            db.set_meta("backfill", f"erro: {e}")
-
-    asyncio.create_task(job())
-    return {"ok": True, "started": True, "pages": pages}
-
-
-@app.get("/api/admin/backfill/status")
-async def admin_backfill_status(request: Request):
-    _require_admin(request)
-    return {"total_in_db": db.message_count(), "last": db.get_meta("backfill", "—")}
-
-
-@app.get("/api/admin/metrics")
-async def admin_metrics(request: Request):
-    _require_admin(request)
-    return await repo.admin_metrics()
+register(app)
 
 FEEDBACK_LOG: list[dict] = []  # Camada 4 — troque por persistência em banco
 
-# --- pub/sub em memória para SSE (tempo real) ------------------------------
-_subscribers: set[asyncio.Queue] = set()
-
-
-async def _publish(event: dict) -> None:
-    for q in list(_subscribers):
-        try:
-            q.put_nowait(event)
-        except Exception:
-            pass
-
 
 def _now() -> str:
-    return dt.datetime.now().strftime("%H:%M")
+    return deps.now_hm()
 
 
 # --------------------------------------------------------------------------
 # API consumida pelo front
 # --------------------------------------------------------------------------
 @app.get("/api/conversations")
-async def conversations(request: Request, mode: str = "smart", q: str = "", day: str = ""):
+async def conversations(
+    request: Request,
+    mode: str = "smart",
+    q: str = "",
+    day: str = "",
+    offset: int = 0,
+    limit: int = 80,
+):
     if not settings.mock and not settings.ploomes_configured:
         raise HTTPException(
             503,
@@ -286,10 +99,93 @@ async def conversations(request: Request, mode: str = "smart", q: str = "", day:
         )
     u = _user(request)
     owner = u.get("owner_id") if u.get("role") == "seller" else None
-    items = await repo.list_conversations(
-        mode=mode, query=q, day=day or None, owner_id=owner, user_id=u.get("id"),
+    items, total = await repo.list_conversations(
+        mode=mode, query=q, day=day or None, owner_id=owner,
+        user_id=u.get("id"), offset=max(0, offset), limit=max(0, limit),
     )
-    return [front_conversation(c) for c in items]
+    lim = limit if limit > 0 else total
+    return {
+        "items": [front_conversation(c) for c in items],
+        "total": total,
+        "offset": offset,
+        "limit": lim,
+        "has_more": limit > 0 and offset + len(items) < total,
+    }
+
+
+@app.get("/api/alerts")
+async def alerts(request: Request):
+    """Fila proativa — reutiliza cache da lista (sem segunda ida ao Ploomes)."""
+    if not settings.mock and not settings.ploomes_configured:
+        return {"alerts": [], "count": 0, "by_kind": {}}
+    import alerts as alerts_mod
+    u = _user(request)
+    owner = u.get("owner_id") if u.get("role") == "seller" else None
+    items = await repo.get_enriched_list(
+        owner_id=owner, user_id=u.get("id"),
+    )
+    out = alerts_mod.build_alerts(
+        items,
+        sla_minutes=settings.sla_first_reply_minutes,
+        reactivation_factor=settings.reactivation_factor,
+        stale_deal_days=settings.stale_deal_days,
+    )
+    out["from_cache"] = True
+    return out
+
+
+@app.get("/api/search")
+async def global_search(request: Request, q: str = ""):
+    u = _user(request)
+    owner = u.get("owner_id") if u.get("role") == "seller" else None
+    return await repo.global_search(
+        q, owner_id=owner, user_id=u.get("id"),
+    )
+
+
+class GoalIn(BaseModel):
+    target: float
+    period: str = ""
+
+
+@app.get("/api/goals")
+async def get_goals(request: Request):
+    u = _user(request)
+    oid = u.get("owner_id") or u.get("id")
+    period = db.current_period()
+    return {
+        "period": period,
+        "target": db.get_goal(int(oid), period),
+        "owner_id": oid,
+    }
+
+
+@app.post("/api/goals")
+async def set_goals(request: Request, body: GoalIn):
+    u = _user(request)
+    if u.get("role") == "seller" and not u.get("owner_id"):
+        raise HTTPException(400, "vendedor sem owner_id no Ploomes")
+    oid = int(u.get("owner_id") or u.get("id"))
+    period = body.period.strip() or db.current_period()
+    if body.target < 0:
+        raise HTTPException(400, "meta inválida")
+    db.set_goal(oid, float(body.target), period)
+    return {"ok": True, "period": period, "target": body.target}
+
+
+@app.get("/api/reports/weekly")
+async def weekly_report(request: Request, format: str = "json"):
+    u = _user(request)
+    uid = u.get("id") if u.get("role") == "seller" else None
+    if format == "csv":
+        from fastapi.responses import PlainTextResponse
+        csv_body = reports_mod.build_weekly_report(uid, as_csv=True)
+        return PlainTextResponse(
+            csv_body,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=cortex-semanal.csv"},
+        )
+    return reports_mod.build_weekly_report(uid, as_csv=False)
 
 
 @app.get("/api/conversations/{conv_id}")
@@ -347,6 +243,7 @@ async def conversation_snooze(conv_id: str, request: Request, body: SnoozeIn):
     hours = max(1, min(body.hours, 168))
     until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=hours)).isoformat()
     db.set_snooze(int(u["id"]), conv_id, until)
+    repo.invalidate_list_cache()
     return {"ok": True, "until": until}
 
 
@@ -354,6 +251,7 @@ async def conversation_snooze(conv_id: str, request: Request, body: SnoozeIn):
 async def conversation_unsnooze(conv_id: str, request: Request):
     u = _user(request)
     db.clear_snooze(int(u["id"]), conv_id)
+    repo.invalidate_list_cache()
     return {"ok": True}
 
 
@@ -457,6 +355,18 @@ async def conversation_messages(conv_id: str):
     return await repo.client_messages(conv_id)
 
 
+class OrderDraftIn(BaseModel):
+    text: str = ""
+
+
+@app.post("/api/conversations/{conv_id}/order-draft")
+async def order_draft(conv_id: str, request: Request, body: OrderDraftIn):
+    """Lê o pedido do cliente (ou um texto colado) e devolve itens com preço
+    da tabela, prontos para virar uma cotação dry-run em /api/documents."""
+    await _enforce_owns(request, conv_id)
+    return await repo.build_order_draft(conv_id, body.text)
+
+
 @app.get("/api/products")
 async def products(q: str = ""):
     if settings.mock or not q:
@@ -473,7 +383,8 @@ async def products(q: str = ""):
 
 # -- criação gated de cotações/pedidos (dry-run -> confirmação) -------------
 @app.post("/api/documents")
-async def documents(req: DocRequest):
+async def documents(req: DocRequest, request: Request):
+    await _enforce_owns(request, req.conversation_id)
     from repository import _resolve_contact
     cid, _, name = await _resolve_contact(req.conversation_id)
     if cid is None:
@@ -481,6 +392,26 @@ async def documents(req: DocRequest):
     if req.dry_run:
         return doc_preview(cid, name, req)
     return await doc_create(cid, name, req)
+
+
+class CreateDealIn(BaseModel):
+    owner_id: int | None = None     # força um dono; senão usa agente/requisitante
+    dry_run: bool = True
+
+
+@app.post("/api/conversations/{conv_id}/create-deal")
+async def create_deal(conv_id: str, request: Request, body: CreateDealIn):
+    """Transforma um lead órfão (wa_...) em negócio no funil de entrada.
+    dry_run=true só mostra o que seria criado; false grava no Ploomes."""
+    u = _user(request)
+    req_owner = u.get("owner_id") if u.get("role") == "seller" else None
+    res = await repo.create_deal_from_orphan(
+        conv_id, owner_id=body.owner_id, requesting_owner_id=req_owner,
+        dry_run=body.dry_run,
+    )
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "falha ao criar negócio"))
+    return res
 
 
 class InteractionIn(BaseModel):
@@ -491,7 +422,8 @@ class InteractionIn(BaseModel):
 
 
 @app.post("/api/interactions")
-async def create_interaction(payload: InteractionIn):
+async def create_interaction(payload: InteractionIn, request: Request):
+    await _enforce_owns(request, payload.conversation_id)
     res = await repo.add_interaction(payload.conversation_id, payload.type_id,
                                      payload.content, payload.title)
     if not res.get("ok"):
@@ -504,14 +436,22 @@ async def list_templates():
     import intents as it
     import templates as tpl
     custom = tpl.load_custom()
+    fb = db.feedback_by_intent()
     out = []
     for intent in it.INTENTS:
         iid = intent["id"]
+        stats = fb.get(iid, {"used": 0, "edited": 0, "ignored": 0,
+                             "total": 0, "acceptance": None})
         out.append({
             "id": iid, "label": intent["label"],
             "text": custom.get(iid) or tpl.DEFAULT_TEMPLATES.get(iid, ""),
             "customized": iid in custom,
+            "feedback": stats,
         })
+    # piores (mais ignorados, com dados) primeiro — chamam atenção pra revisão
+    out.sort(key=lambda t: (t["feedback"]["total"] == 0,
+                            t["feedback"]["acceptance"]
+                            if t["feedback"]["acceptance"] is not None else 1))
     return {"templates": out,
             "placeholders": ["contato", "empresa", "pedido", "status", "entrega",
                              "rastreio", "transportadora", "cidade", "produto",
@@ -528,15 +468,6 @@ async def save_template(payload: TemplateIn):
     import templates as tpl
     tpl.save_custom(payload.intent_id, payload.text)
     return {"ok": True, "customized": bool(payload.text.strip())}
-
-
-@app.post("/api/admin/refresh-fields")
-async def refresh_fields():
-    if settings.mock:
-        return {"ok": False, "mock": True}
-    from ploomes_client import ploomes
-    n = await ploomes.refresh_fields()
-    return {"ok": True, "fields": n}
 
 
 # -- funil: estágios, vendedores, mover/atribuir (writes diretos) ----------
@@ -567,15 +498,17 @@ class StageIn(BaseModel):
 
 
 @app.post("/api/deals/{deal_id}/stage")
-async def move_stage(deal_id: int, payload: StageIn):
+async def move_stage(deal_id: int, payload: StageIn, request: Request):
     if settings.mock:
         return {"ok": False, "error": "modo mock"}
+    await _enforce_owns(request, deal_id)
     from ploomes_client import ploomes
     try:
         await ploomes.update_deal(deal_id, {"StageId": payload.stage_id})
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(502, f"Ploomes: {e}") from e
+        log.error("Ploomes update_deal(stage) falhou (%s): %s", deal_id, e)
+        raise HTTPException(502, "falha ao mover o negócio no Ploomes") from e
 
 
 class OwnerIn(BaseModel):
@@ -583,22 +516,24 @@ class OwnerIn(BaseModel):
 
 
 @app.post("/api/deals/{deal_id}/owner")
-async def assign_owner(deal_id: int, payload: OwnerIn):
+async def assign_owner(deal_id: int, payload: OwnerIn, request: Request):
     if settings.mock:
         return {"ok": False, "error": "modo mock"}
+    await _enforce_owns(request, deal_id)
     from ploomes_client import ploomes
     try:
         await ploomes.update_deal(deal_id, {"OwnerId": payload.owner_id})
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(502, f"Ploomes: {e}") from e
+        log.error("Ploomes update_deal(owner) falhou (%s): %s", deal_id, e)
+        raise HTTPException(502, "falha ao reatribuir o negócio no Ploomes") from e
 
 
 # -- tempo real (Server-Sent Events) ---------------------------------------
 @app.get("/api/stream")
 async def stream():
     q: asyncio.Queue = asyncio.Queue()
-    _subscribers.add(q)
+    deps.subscribers().add(q)
 
     async def gen():
         try:
@@ -610,7 +545,7 @@ async def stream():
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
         finally:
-            _subscribers.discard(q)
+            deps.subscribers().discard(q)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -623,7 +558,8 @@ class SendIn(BaseModel):
 
 
 @app.post("/api/send")
-async def send(payload: SendIn):
+async def send(payload: SendIn, request: Request):
+    await _enforce_owns(request, payload.conversation_id)
     # eco local otimista (best-effort; não bloqueia o envio se faltar no cache)
     await repo.append_seller_message(payload.conversation_id, payload.text, _now())
     out = {"ok": True, "neppo": settings.neppo_enabled}
@@ -638,11 +574,13 @@ async def send(payload: SendIn):
         try:
             await client.send_message(phone, payload.text)
         except Exception as e:
-            raise HTTPException(502, f"Neppo: {e}") from e
+            log.error("Neppo send_message falhou (%s): %s", phone, e)
+            raise HTTPException(502, "falha ao enviar a mensagem no WhatsApp") from e
         out["phone"] = phone
         db.save_message(phone=phone, direction="out", text=payload.text,
                         ts=dt.datetime.now().isoformat())
     repo.invalidate_ai_cache(payload.conversation_id)
+    repo.invalidate_list_cache()
     return out
 
 
@@ -659,57 +597,27 @@ async def feedback(payload: FeedbackIn, request: Request):
     return {"ok": True}
 
 
-# --------------------------------------------------------------------------
-# Webhooks
-# --------------------------------------------------------------------------
-def _valid_webhook(request: Request) -> bool:
-    """Confere a chave do webhook (query `key` ou header X-Webhook-Key).
-    Se nenhuma chave estiver configurada, libera (mas registra aviso)."""
-    if not settings.webhook_protected:
-        log.warning("webhook sem chave configurada — defina WEBHOOK_VALIDATION_KEY")
-        return True
-    key = request.query_params.get("key") or request.headers.get("X-Webhook-Key", "")
-    return key == settings.webhook_validation_key
-
-
-@app.get("/webhooks/neppo")
-async def neppo_validate(request: Request):
-    # validação no estilo Meta: ecoa o challenge
-    challenge = request.query_params.get("hub.challenge")
-    return Response(content=challenge or "ok", media_type="text/plain")
-
-
-@app.post("/webhooks/neppo")
-async def neppo_incoming(request: Request):
-    if not _valid_webhook(request):
-        raise HTTPException(403, "webhook não autorizado")
-    from neppo_client import parse_webhook
-    payload = await request.json()
-    msg = parse_webhook(payload)
-    if msg is None:
-        return {"ignored": True}
-    conv = await repo.append_client_message(msg["phone"], msg["text"], msg["name"], _now())
-    # persiste no banco (histórico permanente, busca, não-lidas)
-    db.save_message(phone=msg["phone"], direction="in", text=msg["text"],
-                    name=msg.get("name", ""), ts=dt.datetime.now().isoformat())
-    if conv:
-        repo.invalidate_ai_cache(conv.id)
-    # avisa as telas abertas em tempo real (SSE)
-    await _publish({"type": "message", "phone": msg["phone"],
-                    "text": msg["text"], "name": msg.get("name", "")})
-    return {"ok": True}
-
-
-@app.post("/webhooks/ploomes")
-async def ploomes_changed(request: Request):
-    if not _valid_webhook(request):
-        raise HTTPException(403, "webhook não autorizado")
-    payload = await request.json()
-    deal_id = payload.get("Id") or payload.get("dealId")
-    if deal_id and not settings.mock:
+@app.on_event("shutdown")
+async def _close_clients():
+    """Fecha os clientes HTTP (Ploomes/Neppo) ao desligar — evita leaks."""
+    try:
         from ploomes_client import ploomes
-        ploomes.invalidate_deal(int(deal_id))   # cache fica fresco
-    return {"ok": True}
+        if ploomes is not None:
+            await ploomes.aclose()
+    except Exception as e:  # noqa: BLE001
+        log.debug("aclose Ploomes: %s", e)
+    try:
+        from neppo_client import _client as _neppo
+        if _neppo is not None:
+            await _neppo.aclose()
+    except Exception as e:  # noqa: BLE001
+        log.debug("aclose Neppo: %s", e)
+    try:
+        import ai as _ai
+        if getattr(_ai, "_http", None) is not None:
+            await _ai._http.aclose()
+    except Exception as e:  # noqa: BLE001
+        log.debug("aclose IA: %s", e)
 
 
 @app.get("/api/health")
@@ -765,7 +673,7 @@ if _bundle_static.is_dir():
             _dst = _static / _f.name
             if _f.resolve() == _dst.resolve():
                 continue
-            if not _dst.exists() or _f.name == "index.html":
+            if _f.suffix in (".css", ".js") or _f.name == "index.html":
                 _shutil.copy2(_f, _dst)
 if _static.exists():
     app.mount("/", StaticFiles(directory=str(_static), html=True), name="static")

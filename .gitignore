@@ -1,5 +1,6 @@
 .env
 .env.local
+.env.bak
 .venv/
 .claude/
 .mcp.json
@@ -11,6 +12,8 @@ __pycache__/
 cortex.db
 cortex.db-wal
 cortex.db-shm
+cortex.db.backup
+*.backup
 build/
 dist/
 *.spec.bak
