@@ -1,0 +1,18 @@
+# nunca leve segredos/banco/dev pra imagem
+.env
+.env.*
+cortex.db
+cortex.db-wal
+cortex.db-shm
+*.backup
+.neppo_lastpage
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.github/
+build/
+dist/
+*.spec
+*.spec.bak
