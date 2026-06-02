@@ -24,3 +24,29 @@ def data_dir() -> Path:
     if is_frozen():
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def ensure_static_assets() -> Path:
+    """Garante static/ em data_dir (volume Fly) com todos os arquivos do bundle."""
+    import shutil
+
+    bundle = app_dir() / "static"
+    dest = data_dir() / "static"
+    dest.mkdir(parents=True, exist_ok=True)
+    if bundle.is_dir() and bundle.resolve() != dest.resolve():
+        for f in bundle.iterdir():
+            if f.is_file():
+                shutil.copy2(f, dest / f.name)
+    idx = app_dir() / "index.html"
+    if idx.exists() and idx.resolve() != (dest / "index.html").resolve():
+        shutil.copy2(idx, dest / "index.html")
+    return dest
+
+
+def static_file(name: str) -> Path:
+    """Resolve arquivo estático (data_dir primeiro, depois bundle em /app)."""
+    p = ensure_static_assets() / name
+    if p.exists():
+        return p
+    fallback = app_dir() / "static" / name
+    return fallback if fallback.exists() else p

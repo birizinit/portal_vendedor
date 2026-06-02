@@ -655,25 +655,10 @@ async def health():
 
 
 # --------------------------------------------------------------------------
-# Front-end estático (coloque painel-vendas.html em ./static/index.html)
+# Front-end estático — bundle em /app/static, cópia para data_dir no Fly
 # --------------------------------------------------------------------------
-from paths import app_dir, data_dir
+from paths import ensure_static_assets
 
-_root = app_dir()
-_static = data_dir() / "static"
-_static.mkdir(parents=True, exist_ok=True)
-import shutil as _shutil
-_idx_src, _idx_dst = _root / "index.html", _static / "index.html"
-if _idx_src.exists() and _idx_src.resolve() != _idx_dst.resolve():
-    _shutil.copy2(_idx_src, _idx_dst)
-_bundle_static = _root / "static"
-if _bundle_static.is_dir():
-    for _f in _bundle_static.iterdir():
-        if _f.is_file():
-            _dst = _static / _f.name
-            if _f.resolve() == _dst.resolve():
-                continue
-            if _f.suffix in (".css", ".js") or _f.name == "index.html":
-                _shutil.copy2(_f, _dst)
+_static = ensure_static_assets()
 if _static.exists():
     app.mount("/", StaticFiles(directory=str(_static), html=True), name="static")

@@ -38,8 +38,11 @@ def _throttled(key: str) -> bool:
 
 @router.get("/login")
 async def login_page():
-    from paths import data_dir
-    return FileResponse(str(data_dir() / "static" / "login.html"))
+    from paths import static_file
+    path = static_file("login.html")
+    if not path.exists():
+        raise HTTPException(503, "login.html não encontrado no deploy")
+    return FileResponse(str(path))
 
 
 @router.post("/api/login")
