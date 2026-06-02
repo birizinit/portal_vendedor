@@ -334,12 +334,14 @@ function renderAgentBanner(){
     if(r.ok){ toast(on?"Piloto ligado":"Piloto desligado"); await loadPilotIds(); await loadAgentInfo(c.id); renderAgentBanner(); renderList(); }
     else toast((await r.json().catch(()=>({}))).detail||"Falha");
   });
-  document.getElementById("assume-btn")?.onclick = async ()=>{
+  const assumeBtn = document.getElementById("assume-btn");
+  if(assumeBtn) assumeBtn.onclick = async ()=>{
     const r = await fetch(`/api/conversations/${encodeURIComponent(c.id)}/assume`,{method:"POST"});
     if(r.ok){ toast("Conversa assumida"); await loadAgentInfo(c.id); renderAgentBanner(); }
     else toast("Falha ao assumir");
   };
-  document.getElementById("agent-log-btn")?.onclick = ()=>{
+  const agentLogBtn = document.getElementById("agent-log-btn");
+  if(agentLogBtn) agentLogBtn.onclick = ()=>{
     const txt = (info.log||[]).slice(0,10).map(x=>`${x.at}: [${x.action}] ${x.reply_text||x.detail||""}`).join("\n");
     alert(txt || "Sem registros");
   };
@@ -1398,7 +1400,8 @@ async function openNightTower(){
   await renderNightTower();
 }
 document.getElementById("rail-night")?.addEventListener("click", openNightTower);
-document.getElementById("night-close")?.onclick=()=>{
+const nightClose = document.getElementById("night-close");
+if(nightClose) nightClose.onclick = ()=>{
   document.getElementById("night-overlay")?.classList.remove("show");
   railReset();
 };
