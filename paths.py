@@ -37,9 +37,13 @@ def ensure_static_assets() -> Path:
         for f in bundle.iterdir():
             if f.is_file():
                 shutil.copy2(f, dest / f.name)
-    idx = app_dir() / "index.html"
-    if idx.exists() and idx.resolve() != (dest / "index.html").resolve():
-        shutil.copy2(idx, dest / "index.html")
+    # index.html canônico fica em static/ — não sobrescrever com cópia antiga na raiz
+    idx_static = bundle / "index.html"
+    idx_root = app_dir() / "index.html"
+    idx_dest = dest / "index.html"
+    if not idx_static.exists() and idx_root.exists():
+        if idx_root.resolve() != idx_dest.resolve():
+            shutil.copy2(idx_root, idx_dest)
     return dest
 
 
