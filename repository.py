@@ -98,6 +98,9 @@ async def _build_conversation_list(
             or query in (c.phone or "") or query in (c.cnpj or "")
         ]
 
+    # consolida por número: 1 card por telefone, com os negócios em .deals
+    items = _group_by_phone(items)
+
     from inbox import enrich_all, sort_conversations
 
     enrich_all(items, user_id=user_id)
@@ -141,6 +144,43 @@ async def warm_ploomes() -> None:
         )
     except Exception as e:  # noqa: BLE001
         log.debug("warm ploomes: %s", e)
+
+
+def _deal_brief(c: Conversation) -> dict:
+    return {
+        "id": c.id, "title": c.name, "stage": c.stage,
+        "stage_id": c.stage_id, "pipeline_id": c.pipeline_id,
+        "value": c.deal_value, "owner": c.owner,
+    }
+
+
+def _group_by_phone(items: list[Conversation]) -> list[Conversation]:
+    """Consolida a lista por TELEFONE — a entidade é o número, não o negócio.
+    Um card por número; os negócios abertos daquele número ficam em `.deals`.
+    Negócios sem telefone resolvível seguem como cards individuais."""
+    from inbox import _digits_for_conv
+
+    groups: dict[str, list[Conversation]] = {}
+    order: list[str] = []          # preserva a ordem de chegada (atividade do Ploomes)
+    singles: list[Conversation] = []
+    for c in items:
+        d = _digits_for_conv(c)
+        tail = d[-8:] if len(d) >= 8 else d
+        if not tail:
+            singles.append(c)
+            continue
+        if tail not in groups:
+            groups[tail] = []
+            order.append(tail)
+        groups[tail].append(c)
+
+    out: list[Conversation] = []
+    for tail in order:
+        convs = groups[tail]
+        primary = convs[0]         # mais recente (open_deals vem por LastUpdateDate desc)
+        primary.deals = [_deal_brief(x) for x in convs if str(x.id).isdigit()]
+        out.append(primary)
+    return out + singles
 
 
 async def _load_from_ploomes(day: Optional[str] = None,
@@ -213,13 +253,17 @@ async def list_conversations(
     items = await get_enriched_list(
         query=query, day=day, owner_id=owner_id, user_id=user_id,
     )
+    from inbox import sort_conversations
     if mode == "action":
         items = [
             c for c in items
             if (c.awaiting_reply or c.unread_count > 0) and not c.snoozed
         ]
-        from inbox import sort_conversations
         items = sort_conversations(items, "action")
+    elif mode == "chrono":
+        # mais recente primeiro (por última atividade no WhatsApp)
+        items = sort_conversations(items, "chrono")
+    # "smart" já vem ordenado por score de get_enriched_list
     total = len(items)
     if limit > 0:
         items = items[offset: offset + limit]

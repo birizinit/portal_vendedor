@@ -59,6 +59,7 @@ class Conversation(BaseModel):
     score: list[ScoreComponent] = []
     order: Order = Order()
     orders: list[dict] = []          # lista resumida p/ o painel (c, s, sc, v)
+    deals: list[dict] = []           # negócios abertos deste número (id/title/stage/value)
     messages: list[Message] = []
     days_without_purchase: Optional[int] = None
     buy_frequency_days: Optional[int] = None
@@ -178,6 +179,7 @@ def front_conversation(c: Conversation) -> dict:
             "qty": o.qty, "unit": o.unit, "stock": o.stock,
         },
         "orders": c.orders,
+        "deals": c.deals,
         "messages": [{"f": "in" if m.sender == "client" else "out",
                       "t": m.text, "h": m.time} for m in c.messages],
         "inbox": {

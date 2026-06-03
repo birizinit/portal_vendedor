@@ -574,6 +574,11 @@ function renderPanel(){
       <a class="btn ghost" id="cta-ploomes" href="https://app.ploomes.com/Deals/${encodeURIComponent(c.id)}" target="_blank" rel="noopener">Abrir no CRM</a>
       <button class="btn ghost" id="cta-snooze" type="button">Adiar 2h</button>
     </div>
+    ${(c.deals && c.deals.length>1) ? `<div class="deal-ctl deal-pick">
+      <select id="deal-sel" title="Este número tem ${c.deals.length} negócios — escolha em qual agir">
+        ${c.deals.map(d=>`<option value="${esc(String(d.id))}">${esc(d.title||('#'+d.id))} · ${esc(d.stage||'—')}${d.value?` · R$ ${esc(d.value)}`:''}</option>`).join("")}
+      </select>
+    </div>` : ""}
     <div class="deal-ctl">
       <select id="stage-sel" title="Mover de estágio"><option>estágio…</option></select>
       <button class="btn ghost" id="assign-btn" title="Trocar vendedor">${IC.user} trocar</button>
@@ -603,6 +608,16 @@ function renderPanel(){
     }catch(e){ toast("Erro de rede"); }
   };
   renderDealControls(c);
+  const dealSel=document.getElementById("deal-sel");
+  if(dealSel){
+    dealSel.value = String(curDeal(c).id);
+    dealSel.onchange = ()=>{
+      DEAL_SEL[c.id]=dealSel.value;
+      renderDealControls(c);
+      const crm=document.getElementById("cta-ploomes");
+      if(crm) crm.href=`https://app.ploomes.com/Deals/${encodeURIComponent(curDeal(c).id)}`;
+    };
+  }
   document.getElementById("assign-btn").onclick = ()=>openAssign(c);
   document.querySelectorAll("#p-tabs button").forEach(b=>b.onclick=()=>{
     state.panelTab=b.dataset.tab; renderPanel();
@@ -885,25 +900,40 @@ document.getElementById("dash-overlay").addEventListener("click",e=>{ if(e.targe
    Mover estágio / atribuir vendedor (write no Ploomes)
    ------------------------------------------------------------ */
 let STAGES=null, USERS=null;
+const DEAL_SEL={};   // conv.id -> negócio selecionado (quando o número tem vários)
 async function getStages(){ if(!STAGES){ try{STAGES=await (await fetch("/api/stages")).json()}catch(e){STAGES=[]} } return STAGES; }
 async function getUsers(){ if(!USERS){ try{USERS=await (await fetch("/api/users")).json()}catch(e){USERS=[]} } return USERS; }
+
+/* negócio "ativo" do card. Um número pode ter vários negócios (c.deals);
+   se nenhum estiver selecionado, usa o primário (deals[0] == o próprio card). */
+function curDeal(c){
+  const deals=c.deals||[];
+  if(!deals.length) return {id:c.id, title:c.name, stage:c.stage,
+                            stage_id:c.stage_id, pipeline_id:c.pipeline_id,
+                            value:c.deal_value, owner:c.owner};
+  const sel=DEAL_SEL[c.id];
+  return deals.find(d=>String(d.id)===String(sel)) || deals[0];
+}
 
 async function renderDealControls(c){
   const sel=document.getElementById("stage-sel"); if(!sel) return;
   const all=await getStages();
   if(c.id!==state.activeId) return;
-  const stages=all.filter(s=>!c.pipeline_id || s.pipeline===c.pipeline_id);
+  const d=curDeal(c);
+  const stages=all.filter(s=>!d.pipeline_id || s.pipeline===d.pipeline_id);
   sel.innerHTML = stages.length
-    ? stages.map(s=>`<option value="${s.id}" ${s.id===c.stage_id?"selected":""}>${esc(s.name)}</option>`).join("")
-    : `<option>${esc(c.stage||"—")}</option>`;
+    ? stages.map(s=>`<option value="${s.id}" ${s.id===d.stage_id?"selected":""}>${esc(s.name)}</option>`).join("")
+    : `<option>${esc(d.stage||"—")}</option>`;
   async function moveStage(sid, withUndo){
-    const prev=c.stage_id, prevName=c.stage;
+    const prev=d.stage_id, prevName=d.stage;
     try{
-      const r=await fetch(`/api/deals/${encodeURIComponent(c.id)}/stage`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({stage_id:sid})});
-      if(r.ok){ const st=stages.find(x=>x.id===sid); c.stage_id=sid; if(st) c.stage=st.name; renderList();
-        if(withUndo && prev) toastAction("Estágio atualizado","Desfazer",()=>{ c.stage=prevName; moveStage(prev,false); renderDealControls(c); });
+      const r=await fetch(`/api/deals/${encodeURIComponent(d.id)}/stage`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({stage_id:sid})});
+      if(r.ok){ const st=stages.find(x=>x.id===sid); d.stage_id=sid; if(st) d.stage=st.name;
+        if(String(d.id)===String(c.id)){ c.stage_id=sid; if(st) c.stage=st.name; }
+        renderList();
+        if(withUndo && prev) toastAction("Estágio atualizado","Desfazer",()=>{ d.stage=prevName; moveStage(prev,false); renderDealControls(c); });
         else toast("Estágio atualizado");
-      } else { const e=await r.json().catch(()=>({})); toast(e.detail||"Falha ao mover"); sel.value=c.stage_id; }
+      } else { const e=await r.json().catch(()=>({})); toast(e.detail||"Falha ao mover"); sel.value=d.stage_id; }
     }catch(e){ toast("Erro de rede"); }
   }
   sel.onchange=()=>moveStage(+sel.value, true);
@@ -927,10 +957,10 @@ function paintAssign(users){
   const list=document.getElementById("assign-list");
   list.innerHTML = users.length ? users.map(u=>`<div class="pr" data-id="${u.id}"><span>${esc(u.name)}</span></div>`).join("") : `<div class="pr">Nada encontrado</div>`;
   list.querySelectorAll(".pr[data-id]").forEach(n=>n.onclick=async()=>{
-    const oid=+n.dataset.id, c=assignConv;
+    const oid=+n.dataset.id, c=assignConv, d=curDeal(c);
     try{
-      const r=await fetch(`/api/deals/${encodeURIComponent(c.id)}/owner`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({owner_id:oid})});
-      if(r.ok){ c.owner=n.textContent.trim(); toast("Vendedor atribuído"); document.getElementById("assign-overlay").classList.remove("show"); renderAll(); }
+      const r=await fetch(`/api/deals/${encodeURIComponent(d.id)}/owner`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({owner_id:oid})});
+      if(r.ok){ d.owner=n.textContent.trim(); if(String(d.id)===String(c.id)) c.owner=d.owner; toast("Vendedor atribuído"); document.getElementById("assign-overlay").classList.remove("show"); renderAll(); }
       else toast("Falha ao atribuir");
     }catch(e){ toast("Erro de rede"); }
   });
