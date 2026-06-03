@@ -597,6 +597,12 @@ async def feedback(payload: FeedbackIn, request: Request):
     return {"ok": True}
 
 
+@app.on_event("startup")
+async def _startup_workers():
+    from portfolio_campaign import start_campaign_worker
+    start_campaign_worker()
+
+
 @app.on_event("shutdown")
 async def _close_clients():
     """Fecha os clientes HTTP (Ploomes/Neppo) ao desligar — evita leaks."""

@@ -78,6 +78,22 @@ class Settings:
     night_max_replies: int = int(os.getenv("CORTEX_NIGHT_MAX_REPLIES", "5"))
     night_cooldown_sec: int = int(os.getenv("CORTEX_NIGHT_COOLDOWN_SEC", "120"))
 
+    # ---- Carteira (sync + campanhas WhatsApp) ----
+    portfolio_sync_page_size: int = int(os.getenv("CORTEX_PORTFOLIO_PAGE_SIZE", "100"))
+    portfolio_sync_max_pages: int = int(os.getenv("CORTEX_PORTFOLIO_MAX_PAGES", "80"))
+    portfolio_campaign_delay_sec: float = float(
+        os.getenv("CORTEX_PORTFOLIO_CAMPAIGN_DELAY", "60"),
+    )
+    portfolio_campaign_max_per_day: int = int(
+        os.getenv("CORTEX_PORTFOLIO_CAMPAIGN_MAX_DAY", "80"),
+    )
+    portfolio_campaign_hour_start: int = int(
+        os.getenv("CORTEX_PORTFOLIO_HOUR_START", "8"),
+    )
+    portfolio_campaign_hour_end: int = int(
+        os.getenv("CORTEX_PORTFOLIO_HOUR_END", "18"),
+    )
+
     @property
     def cors_origins(self) -> list[str]:
         if self.cors_origins_raw.strip():

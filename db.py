@@ -98,6 +98,64 @@ def _init(c: sqlite3.Connection) -> None:
             at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS ix_agent_log_conv ON agent_log(conv_id, at);
+        CREATE TABLE IF NOT EXISTS portfolio_contacts(
+            contact_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            name TEXT,
+            company TEXT,
+            phone TEXT,
+            phone_tail TEXT,
+            cnpj TEXT,
+            city TEXT,
+            segment TEXT,
+            client_status TEXT,
+            days_without_purchase INTEGER,
+            buy_frequency_days INTEGER,
+            last_purchase TEXT,
+            open_quotes INTEGER DEFAULT 0,
+            open_quotes_value REAL DEFAULT 0,
+            tags_json TEXT,
+            synced_at TEXT,
+            PRIMARY KEY(owner_id, contact_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_pf_owner_days ON portfolio_contacts(owner_id, days_without_purchase);
+        CREATE INDEX IF NOT EXISTS ix_pf_owner_phone ON portfolio_contacts(owner_id, phone_tail);
+        CREATE TABLE IF NOT EXISTS portfolio_sync(
+            owner_id INTEGER PRIMARY KEY,
+            status TEXT,
+            total INTEGER DEFAULT 0,
+            synced INTEGER DEFAULT 0,
+            message TEXT,
+            started_at TEXT,
+            finished_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS portfolio_campaigns(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            user_id INTEGER,
+            filter_key TEXT,
+            template_id TEXT,
+            template_body TEXT,
+            status TEXT DEFAULT 'pending',
+            total INTEGER DEFAULT 0,
+            sent INTEGER DEFAULT 0,
+            failed INTEGER DEFAULT 0,
+            skipped INTEGER DEFAULT 0,
+            created_at TEXT,
+            finished_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS portfolio_campaign_items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id INTEGER NOT NULL,
+            contact_id INTEGER,
+            phone TEXT,
+            name TEXT,
+            message TEXT,
+            status TEXT DEFAULT 'pending',
+            error TEXT,
+            sent_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_pfcamp ON portfolio_campaign_items(campaign_id, status);
         """
     )
     # migração: coluna 'active' em users (bancos antigos)

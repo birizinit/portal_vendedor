@@ -1629,6 +1629,187 @@ document.getElementById("um-report")?.addEventListener("click", ()=>{
   document.getElementById("usermenu")?.classList.remove("show");
 });
 
+/* ---------- Carteira (portfolio) ---------- */
+let PF = { stats: null, filter: "has_phone", q: "", offset: 0, total: 0, items: [], templates: [] };
+
+async function loadPfStats(){
+  const r = await fetch("/api/portfolio/stats");
+  if(!r.ok) throw new Error("Erro ao carregar carteira");
+  const j = await r.json();
+  PF.stats = j.stats;
+  const sync = j.sync || {};
+  const el = document.getElementById("pf-sync-label");
+  if(el){
+    if(sync.status === "running") el.textContent = `Sincronizando… ${sync.synced||0}/${sync.total||"?"}`;
+    else if(sync.finished_at) el.textContent = sync.message || `${PF.stats?.total||0} clientes`;
+    else el.textContent = "Clique em Atualizar para importar do Ploomes";
+  }
+  document.getElementById("pf-campaign-btn").disabled = !(PF.stats?.total > 0);
+}
+
+function renderPfDash(){
+  const s = PF.stats || {};
+  const chips = [
+    ["", "Total", s.total],
+    ["has_phone", "Com WhatsApp", s.with_phone],
+    ["open_quote", "Orç. aberto", s.open_quote],
+    ["no_purchase_7", "7+ dias", s.no_purchase_7],
+    ["no_purchase_30", "30+ dias", s.no_purchase_30],
+    ["no_purchase_60", "60+ dias", s.no_purchase_60],
+  ];
+  document.getElementById("pf-dash").innerHTML = chips.map(([k,lbl,n])=>
+    `<div class="pf-kpi ${PF.filter===k?"on":""}" data-pf="${esc(k)}"><div class="n">${(n??0).toLocaleString("pt-BR")}</div><div class="k">${esc(lbl)}</div></div>`
+  ).join("");
+  document.getElementById("pf-dash").querySelectorAll(".pf-kpi").forEach(el=>{
+    el.onclick = ()=>{ PF.filter = el.dataset.pf; document.getElementById("pf-filter").value = PF.filter; PF.offset=0; loadPfList(false); };
+  });
+}
+
+async function loadPfList(append){
+  if(!append) PF.offset = 0;
+  const q = encodeURIComponent(PF.q||"");
+  const f = encodeURIComponent(PF.filter||"");
+  const r = await fetch(`/api/portfolio/contacts?filter=${f}&q=${q}&offset=${PF.offset}&limit=80`);
+  if(!r.ok){ toast("Erro na lista da carteira"); return; }
+  const j = await r.json();
+  const items = j.items || [];
+  PF.items = append ? PF.items.concat(items) : items;
+  PF.total = j.total || 0;
+  PF.offset += items.length;
+  document.getElementById("pf-count").textContent =
+    `${PF.items.length} de ${PF.total.toLocaleString("pt-BR")} clientes`;
+  const more = document.getElementById("pf-more");
+  more.style.display = PF.offset < PF.total ? "block" : "none";
+  more.onclick = ()=>loadPfList(true);
+  const tb = document.getElementById("pf-tbody");
+  const rows = (append ? items : PF.items).map(row=>{
+    const tags = (row.tags||[]).map(t=>`<span class="chip ${t.k||""}">${esc(t.l)}</span>`).join("");
+    const dias = row.days_without_purchase != null ? `${row.days_without_purchase}d` : "—";
+    const orc = row.open_quotes > 0 ? `${row.open_quotes} (${moneyShort(row.open_quotes_value||0)})` : "—";
+    return `<tr data-cid="${row.contact_id}">
+      <td><div class="pf-name">${esc(row.name||"—")}</div><div style="color:var(--faint);font-size:11px">${esc(row.company||row.segment||"")}</div></td>
+      <td>${esc(row.phone||"—")}</td>
+      <td>${esc(dias)}</td>
+      <td>${esc(orc)}</td>
+      <td><div class="pf-tags">${tags||"—"}</div></td>
+      <td><button type="button" class="btn ghost pf-open" style="height:28px;font-size:11px">Inbox</button></td>
+    </tr>`;
+  }).join("");
+  if(append) tb.innerHTML += rows;
+  else tb.innerHTML = rows;
+  tb.querySelectorAll(".pf-open").forEach(btn=>{
+    btn.onclick = ()=>{
+      const tr = btn.closest("tr");
+      const cid = tr?.dataset.cid;
+      const row = PF.items.find(x=>String(x.contact_id)===String(cid));
+      if(row) openPortfolioInbox(row);
+    };
+  });
+}
+
+function openPortfolioInbox(row){
+  document.body.classList.remove("view-portfolio");
+  railReset();
+  const tail = (row.phone||"").replace(/\D/g,"").slice(-8);
+  let c = DATA.find(x=>(x.phone||"").replace(/\D/g,"").includes(tail));
+  if(!c && tail) c = DATA.find(x=>x.id===`wa_${tail}`);
+  if(c){ state.activeId=c.id; if(window.innerWidth<=820) document.body.classList.add("show-thread"); renderAll(); }
+  else toast("Conversa não encontrada — sincronize o inbox ou aguarde mensagem do cliente");
+}
+
+async function openPortfolio(){
+  document.body.classList.add("view-portfolio");
+  document.querySelectorAll(".rail-btn").forEach(x=>x.classList.remove("on"));
+  document.getElementById("rail-portfolio")?.classList.add("on");
+  PF.filter = document.getElementById("pf-filter").value || "has_phone";
+  try{
+    await loadPfStats();
+    renderPfDash();
+    await loadPfList(false);
+  }catch(e){ toast(e.message||"Erro na carteira"); }
+}
+
+function showInboxView(){
+  document.body.classList.remove("view-portfolio");
+  railReset();
+}
+
+async function pfSync(){
+  const btn = document.getElementById("pf-sync-btn");
+  btn.disabled = true;
+  try{
+    const r = await fetch("/api/portfolio/sync",{method:"POST"});
+    const j = await r.json().catch(()=>({}));
+    toast(j.message||"Sincronização iniciada");
+    const poll = setInterval(async ()=>{
+      await loadPfStats();
+      renderPfDash();
+      const j = await (await fetch("/api/portfolio/stats")).json();
+      const sync = j.sync;
+      if(sync?.status !== "running"){
+        clearInterval(poll);
+        await loadPfList(false);
+        btn.disabled = false;
+        toast(sync?.message || "Carteira atualizada");
+      }
+    }, 2500);
+    setTimeout(()=>{ clearInterval(poll); btn.disabled=false; }, 120000);
+  }catch(e){ btn.disabled=false; toast("Falha ao sincronizar"); }
+}
+
+async function openPfCampaign(){
+  if(!PF.templates.length){
+    try{ PF.templates = (await (await fetch("/api/portfolio/templates")).json()).templates||[]; }catch(_){}
+  }
+  const sel = document.getElementById("pf-template");
+  sel.innerHTML = PF.templates.map(t=>`<option value="${esc(t.id)}">${esc(t.title)}</option>`).join("");
+  document.getElementById("pf-campaign-overlay").classList.add("show");
+  await refreshPfPreview();
+  sel.onchange = refreshPfPreview;
+}
+
+async function refreshPfPreview(){
+  const tid = document.getElementById("pf-template").value;
+  const r = await fetch("/api/portfolio/campaigns/preview",{
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ filter: PF.filter||"", template_id: tid, limit: 500 }),
+  });
+  const j = await r.json().catch(()=>({}));
+  const prev = document.getElementById("pf-preview");
+  if(!r.ok){ prev.textContent = j.detail||"Erro"; return; }
+  const sample = (j.samples||[])[0];
+  prev.innerHTML = `<div style="margin-bottom:8px;color:var(--dim)">Alcance: <b>${j.with_phone||0}</b> com telefone (máx. ${j.will_send||0} por campanha)</div>`
+    + (sample ? `<div><b>${esc(sample.name)}</b> — ${esc(sample.phone)}</div><div style="margin-top:8px">${esc(sample.message)}</div>` : "");
+}
+
+document.getElementById("rail-portfolio")?.addEventListener("click", openPortfolio);
+document.getElementById("rail-inbox")?.addEventListener("click", showInboxView);
+document.getElementById("pf-sync-btn")?.addEventListener("click", pfSync);
+document.getElementById("pf-campaign-btn")?.addEventListener("click", openPfCampaign);
+const pfCampClose = document.getElementById("pf-campaign-close");
+if(pfCampClose) pfCampClose.onclick = ()=>document.getElementById("pf-campaign-overlay").classList.remove("show");
+document.getElementById("pf-campaign-overlay")?.addEventListener("click", e=>{
+  if(e.target.id==="pf-campaign-overlay") e.currentTarget.classList.remove("show");
+});
+const pfCampGo = document.getElementById("pf-campaign-go");
+if(pfCampGo) pfCampGo.onclick = async ()=>{
+  const tid = document.getElementById("pf-template").value;
+  const r = await fetch("/api/portfolio/campaigns",{
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ filter: PF.filter||"", template_id: tid, confirm: true, limit: 500 }),
+  });
+  const j = await r.json().catch(()=>({}));
+  if(r.ok){ toast(j.message||"Campanha na fila"); document.getElementById("pf-campaign-overlay").classList.remove("show"); }
+  else toast(j.detail||"Falha");
+};
+document.getElementById("pf-q")?.addEventListener("input", e=>{
+  PF.q = e.target.value;
+  clearTimeout(window._pfSearchT);
+  window._pfSearchT = setTimeout(()=>loadPfList(false), 350);
+});
+const pfFilterEl = document.getElementById("pf-filter");
+if(pfFilterEl) pfFilterEl.onchange = e=>{ PF.filter = e.target.value; PF.offset=0; loadPfList(false); };
+
 async function boot(){
   try {
     if(typeof Notification !== "undefined" && Notification.permission === "default")
